@@ -1,0 +1,18 @@
+# 端でクリップ（既定）、左右=1.25倍、下=1.25倍
+python yolo2cls.py \
+  --dataset "/data/set1/images:/data/set1/labels" \
+  --out ./cls_dataset \
+  --names ./classes.names \
+  --val-split 0.1 \
+  --scale-lr 1.25 \
+  --scale-bottom 1.25 \
+  --min-side 64 \
+  --precreate-dirs
+
+# 倍率を変えて試す例（左右1.4倍・下1.1倍）
+python yolo2cls.py \
+  --dataset "/data/set1/images:/data/set1/labels" \
+  --out ./cls_dataset_v2 \
+  --names ./classes.names \
+  --scale-lr 1.4 \
+  --scale-bottom 1.1
