@@ -2,24 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-yolo2cls.py
+yolo2cls_pad.py
 YOLO(txt) → 画像分類用フォルダ（ImageFolder互換）変換スクリプト
-
-出力構成:
+・上端固定で左右/下方向を倍率拡張（端ではclip）
+・切り出し後、アスペクト比を保持したまま正方形へパディング（ImageOps.pad）
+出力:
   out_root/
     train/<class_name>/*.jpg
-    val/<class_name>/*.jpg     # --val-split > 0 のとき
-
-仕様（今回の要件）:
-- 上端は固定
-- 左右(幅)と下方向(高さ)を倍率で拡張（--scale-lr, --scale-bottom）
-- 端に当たったら「そこで止める（clip）」…平行移動はしない
-- 複数データセット (images, labels) を一括指定可
+    val/<class_name>/*.jpg   # --val-split > 0 のとき
 """
 
 import argparse
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageOps
 import random
 from typing import List, Tuple, Optional
 
@@ -43,7 +38,7 @@ def yolo_norm_to_xyxy(img_w: int, img_h: int, cx: float, cy: float, w: float, h:
 def expand_keep_top_clip_edges(x1, y1, x2, y2, W, H, scale_lr=1.25, scale_bottom=1.25):
     """
     上端(y1)固定のまま、左右(幅)と下端(高さ)を拡張。
-    画像端に当たった部分は「そこで止める（clip）」…平行移動はしない。
+    画像端に当たった部分は clip（平行移動しない）。
     """
     # 幅拡張（中心基準）
     w = max(1, x2 - x1)
@@ -52,19 +47,19 @@ def expand_keep_top_clip_edges(x1, y1, x2, y2, W, H, scale_lr=1.25, scale_bottom
     nx1 = int(round(cx - new_w / 2))
     nx2 = int(round(cx + new_w / 2))
 
-    # 高さ拡張（上固定で下へ伸ばす）
+    # 高さ拡張（上固定で下へ）
     h = max(1, y2 - y1)
     new_h = max(1, int(round(h * scale_bottom)))
     ny1 = y1
     ny2 = y1 + new_h
 
-    # 端でクリップ（平行移動はしない）
+    # 端でクリップ
     nx1 = max(0, nx1)
-    ny1 = max(0, ny1)  # 上端固定なので通常は変わらない
+    ny1 = max(0, ny1)
     nx2 = min(W, nx2)
     ny2 = min(H, ny2)
 
-    # 退化防止（最低1pxは確保）
+    # 退化防止
     if nx2 <= nx1: nx2 = min(W, nx1 + 1)
     if ny2 <= ny1: ny2 = min(H, ny1 + 1)
     return nx1, ny1, nx2, ny2
@@ -73,11 +68,17 @@ def list_images(root: Path):
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
     return sorted([p for p in root.rglob("*") if p.suffix.lower() in exts])
 
-def save_crop(img_path: Path, box_xyxy, out_dir: Path, stem: str, idx: int):
+def save_crop(img_path: Path, box_xyxy, out_dir: Path, stem: str, idx: int,
+              resize_size: int, pad_color=(0, 0, 0)):
+    """
+    切り出し→アスペクト比維持パディング→正方形resize保存
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     with Image.open(img_path) as im:
         im = im.convert("RGB")
-        crop = im.crop(box_xyxy)
+        crop = im.crop(box_xyxy)  # (left, upper, right, lower)
+        # アスペクト比を維持しながら正方形にパディングしてリサイズ
+        crop = ImageOps.pad(crop, (resize_size, resize_size), color=pad_color, centering=(0.5, 0.5))
         crop.save(out_dir / f"{stem}_{idx}.jpg", quality=95)
 
 def precreate_class_dirs(out_root: Path, classes: List[str], create_val: bool):
@@ -87,7 +88,8 @@ def precreate_class_dirs(out_root: Path, classes: List[str], create_val: bool):
 
 # ---------- core ----------
 def process_one_pair(images_dir: Path, labels_dir: Path, out_root: Path, names: Optional[List[str]],
-                     val_split: float, scale_lr: float, scale_bottom: float, min_side: int) -> int:
+                     val_split: float, scale_lr: float, scale_bottom: float, min_side: int,
+                     resize_size: int, pad_color):
     images = list_images(images_dir)
     if not images:
         print(f"[WARN] No images under: {images_dir}")
@@ -108,7 +110,7 @@ def process_one_pair(images_dir: Path, labels_dir: Path, out_root: Path, names: 
             print(f"[WARN] Skip broken image: {img_path} ({e})")
             continue
 
-        # ラベル読み込み（UTF-8優先、ダメならcp932）
+        # ラベル読み込み（UTF-8優先→cp932フォールバック）
         try:
             text = label_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -127,25 +129,22 @@ def process_one_pair(images_dir: Path, labels_dir: Path, out_root: Path, names: 
                 continue
 
             x1, y1, x2, y2 = yolo_norm_to_xyxy(W, H, cx, cy, bw, bh)
-            x1, y1, x2, y2 = expand_keep_top_clip_edges(
-                x1, y1, x2, y2, W, H, scale_lr=scale_lr, scale_bottom=scale_bottom
-            )
-
-            # 小さすぎるクロップはスキップ
+            x1, y1, x2, y2 = expand_keep_top_clip_edges(x1, y1, x2, y2, W, H,
+                                                        scale_lr=scale_lr, scale_bottom=scale_bottom)
             if (x2 - x1) < min_side or (y2 - y1) < min_side:
                 continue
 
             cname = names[cid] if (names and 0 <= cid < len(names)) else str(cid)
             split = "val" if (val_split > 0 and random.random() < val_split) else "train"
             out_dir = out_root / split / cname
-            save_crop(img_path, (x1, y1, x2, y2), out_dir, stem, idx)
+            save_crop(img_path, (x1, y1, x2, y2), out_dir, stem, idx, resize_size, pad_color)
             saved += 1
             idx += 1
     return saved
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="YOLO→分類フォルダ(ImageFolder互換) 変換ツール（端はclip）")
-    # 入力：--dataset（複数） または --images/--labels を同数回
+    ap = argparse.ArgumentParser(description="YOLO→分類フォルダ（余白パディングで正方形化）")
+    # 入力指定（どちらか/併用可）
     ap.add_argument("--dataset", action="append",
                     help="画像:ラベル のペアを 'IMAGES_DIR:LABELS_DIR' 形式で（複数可）。Windowsは --images/--labels 推奨。")
     ap.add_argument("--images", action="append", help="画像ディレクトリ（複数可・--labels と同数）")
@@ -155,15 +154,30 @@ def parse_args():
     ap.add_argument("--names", default="", help=".names（1行1クラス名）。省略可（数値IDフォルダになる）")
     ap.add_argument("--val-split", type=float, default=0.0, help="検証に回す割合（例 0.1）")
 
-    # ← ここで倍率をすぐ変えられます
-    ap.add_argument("--scale-lr", type=float, default=1.25, help="左右(幅)の拡張倍率")
-    ap.add_argument("--scale-bottom", type=float, default=1.25, help="下方向(高さ)の拡張倍率")
+    # 拡大倍率（コマンドから即変更可）
+    ap.add_argument("--scale-lr", type=float, default=1.25, help="左右(幅)の拡大倍率")
+    ap.add_argument("--scale-bottom", type=float, default=1.25, help="下方向(高さ)の拡大倍率")
 
     ap.add_argument("--min-side", type=int, default=32, help="切り出し後の最小辺ピクセル")
+
+    # パディング付きリサイズ設定
+    ap.add_argument("--resize", type=int, default=384, help="正方形の出力サイズ（例: 384 → 384x384）")
+    ap.add_argument("--pad-color", type=str, default="0,0,0",
+                    help="パディング色を 'R,G,B' で指定（例: '0,0,0' 黒 / '255,255,255' 白 / '128,128,128' グレー）")
+
     ap.add_argument("--seed", type=int, default=42, help="val split の乱数シード")
     ap.add_argument("--precreate-dirs", action="store_true",
                     help="namesがある場合に train/val の全クラスサブフォルダを事前作成")
     return ap.parse_args()
+
+def parse_color(s: str):
+    try:
+        parts = [int(v) for v in s.split(",")]
+        if len(parts) != 3:
+            raise ValueError
+        return tuple(max(0, min(255, v)) for v in parts)
+    except Exception:
+        raise SystemExit(f"--pad-color は 'R,G,B'（0-255）で指定してください。例: 0,0,0")
 
 def main():
     args = parse_args()
@@ -171,6 +185,7 @@ def main():
 
     out_root = Path(args.out); out_root.mkdir(parents=True, exist_ok=True)
     names = load_names(args.names) if args.names else None
+    pad_color = parse_color(args.pad_color)  # ← 修正済み（ハイフンではなくアンダースコア）
 
     # 入力ペアの解決
     pairs: List[Tuple[Path, Path]] = []
@@ -204,7 +219,7 @@ def main():
         saved = process_one_pair(
             images_dir=img_dir, labels_dir=lbl_dir, out_root=out_root, names=names,
             val_split=args.val_split, scale_lr=args.scale_lr, scale_bottom=args.scale_bottom,
-            min_side=args.min_side
+            min_side=args.min_side, resize_size=args.resize, pad_color=pad_color
         )
         print(f"  -> saved crops: {saved}")
         total_saved += saved
