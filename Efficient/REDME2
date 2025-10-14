@@ -1,0 +1,5 @@
+python predict.py \
+  --ckpt "./runs/effnetv2_s_384/best.ckpt" \
+  --model efficientnetv2_s \
+  --img-size 384 \
+  --input "/path/to/test_images"

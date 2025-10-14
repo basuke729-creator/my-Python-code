@@ -1,0 +1,18 @@
+# 例: あなたの出力データを使う
+DATA_ROOT="/path/to/cls_dataset"   # train/ val/ の親
+OUTDIR="./runs/effnetv2_s_384"
+
+python train_effnetv2.py \
+  --data "$DATA_ROOT" \
+  --out "$OUTDIR" \
+  --model efficientnetv2_s \
+  --img-size 384 \
+  --batch-size 32 \
+  --epochs 25 \
+  --lr 3e-4 \
+  --wd 1e-4 \
+  --aug light \
+  --amp \
+  --tensorboard \
+  --weighted-sampler \
+  --weighted-loss
