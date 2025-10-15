@@ -3,8 +3,8 @@ DATA_ROOT="/path/to/cls_dataset"   # train/ val/ の親
 OUTDIR="./runs/effnetv2_s_384"
 
 python train_effnetv2.py \
-  --data "$DATA_ROOT" \
-  --out "$OUTDIR" \
+  --data "./cls_dataset" \
+  --out "./runs/effnetv2_s_384" \
   --model efficientnetv2_s \
   --img-size 384 \
   --batch-size 32 \
@@ -15,4 +15,5 @@ python train_effnetv2.py \
   --amp \
   --tensorboard \
   --weighted-sampler \
-  --weighted-loss
+  --weighted-loss \
+  --drop 0.1    # 例：Dropout を適度に（0.0〜0.3 で調整）

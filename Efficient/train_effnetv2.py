@@ -79,7 +79,14 @@ def build_dataloaders(data_root: str, img_size: int, batch_size: int, workers: i
     return train_loader, val_loader, class_names, class_weights
 
 def build_model(model_name: str, num_classes: int, pretrained: bool, drop: float):
-    model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes, drop=drop)
+    # timm は 'drop_rate' / 'drop_path_rate' を使う
+    model = timm.create_model(
+        model_name,
+        pretrained=pretrained,
+        num_classes=num_classes,
+        drop_rate=drop,        # ← ここがポイント
+        drop_path_rate=drop    # お好みで同じ値を Stochastic Depth にも適用
+    )
     return model
 
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
