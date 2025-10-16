@@ -13,3 +13,16 @@ print("cuda_available:", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("device:", torch.cuda.get_device_name(0))
 PY
+
+
+python predict.py \
+  --ckpt "runs/tf_effnetv2_s_in21k_ft1k_384/best.ckpt" \
+  --model tf_efficientnetv2_s_in21k_ft_in1k \
+  --img-size 384 \
+  --input "./test_images" \
+  --resize-mode pad --bg black \
+  --tta \
+  --threshold 0.60 \
+  --topk 3 \
+  --save-csv "runs/preds.csv" \
+  --save-per-class "runs/preds_split"
