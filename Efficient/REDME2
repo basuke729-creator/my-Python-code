@@ -26,3 +26,4 @@ python predict.py \
   --topk 3 \
   --save-csv "runs/preds.csv" \
   --save-per-class "runs/preds_split"
+
