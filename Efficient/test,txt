@@ -1,0 +1,14 @@
+python predict.py \
+  --ckpt "runs/tf_effnetv2_s_in21k_ft1k_384/best.ckpt" \
+  --model tf_efficientnetv2_s_in21k_ft_in1k \
+  --img-size 384 \
+  --input "test_crops" \
+  --resize-mode pad \
+  --topk 3 \
+  --save-csv "runs/preds.csv"
+
+
+python evaluate_predictions.py \
+  --preds-csv "runs/preds.csv" \
+  --output-dir "runs/eval_report" \
+  --export-miscls
