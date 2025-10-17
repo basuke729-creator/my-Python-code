@@ -17,3 +17,36 @@ python train_effnetv2.py \
   --weighted-sampler \
   --weighted-loss \
   --drop 0.1    # 例：Dropout を適度に（0.0〜0.3 で調整）
+
+  python train_effnetv2.py \
+  --data "./cls_dataset" \
+  --out "./runs/effv2_s_phaseA" \
+  --model tf_efficientnetv2_s_in21k_ft_in1k \
+  --img-size 384 \
+  --batch-size 32 \
+  --epochs 5 \
+  --lr 1e-3 \
+  --wd 1e-4 \
+  --freeze-backbone \
+  --warmup-epochs 1 \
+  --min-lr 1e-5 \
+  --amp \
+  --aug light
+
+
+  python train_effnetv2.py \
+  --data "./cls_dataset" \
+  --out "./runs/effv2_s_phaseB" \
+  --model tf_efficientnetv2_s_in21k_ft_in1k \
+  --img-size 384 \
+  --batch-size 32 \
+  --epochs 25 \
+  --lr 1e-4 \
+  --head-lr-mult 10 \
+  --wd 1e-4 \
+  --warmup-epochs 3 \
+  --min-lr 1e-6 \
+  --init-from "./runs/effv2_s_phaseA/best.ckpt" \
+  --amp \
+  --aug light
+
