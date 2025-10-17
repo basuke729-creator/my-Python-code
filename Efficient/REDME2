@@ -27,3 +27,17 @@ python predict.py \
   --save-csv "runs/preds.csv" \
   --save-per-class "runs/preds_split"
 
+python predict.py \
+  --ckpt "runs/effv2_s_phaseB/best.ckpt" \
+  --model tf_efficientnetv2_s_in21k_ft_in1k \
+  --img-size 384 \
+  --input "test_crops" \
+  --resize-mode pad --bg black \
+  --tta \
+  --threshold 0.60 \
+  --topk 3 \
+  --save-csv "runs/preds.csv" \
+  --save-per-class "runs/preds_split" \
+  --eval --eval-out "runs/eval_from_predict" \
+  --export-miscls --miscls-limit 50
+
