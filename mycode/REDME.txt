@@ -32,3 +32,12 @@ python yolo2cls_pad_dirs.py ^
   --min-side 64 ^
   --precreate-dirs
 
+python yolo2cls_pad_dirs.py \
+  --dataset "Image_cropping/R0010085/images:Image_cropping/R0010085/labels" \
+  --out "cls_test_crops" \
+  --names "Image_cropping/R0010085/classes.names" \
+  --scale-left 1.25 --scale-right 1.25 --scale-top 1.10 --scale-bottom 1.25 \
+  --img-size 384 --pad-bg black \
+  --keep-empty-dirs \
+  --log "cls_test_crops/_convert.log"
+
