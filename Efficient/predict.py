@@ -1,4 +1,4 @@
-# predict.py  (inference + optional evaluation outputs)
+# predict.py  (inference + evaluation; robust class extraction; fixed exception)
 import argparse, csv, os, shutil, json
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -126,22 +126,20 @@ def topk_from_probs(probs: torch.Tensor, class_names: List[str], k: int):
     names = [class_names[i] for i in idx]
     return list(zip(names, conf))
 
+# -------- robust: 親/クラス/画像 の “クラス” を相対パスの最初から取得 --------
 def infer_true_label(img_path: Path, input_root: Path) -> Optional[str]:
-    """input_root/クラス名/xxx.jpg のとき、そのクラス名を返す。そうでなければ None。"""
     try:
-        img_path = img_path.resolve()
-        input_root = input_root.resolve()
+        rel = img_path.resolve().relative_to(input_root.resolve())
     except Exception:
-        pass
-    if input_root in img_path.parents:
-        parent = img_path.parent
-        if parent != input_root:
-            return parent.name
+        return None
+    parts = rel.parts
+    if len(parts) >= 2:
+        return parts[0]            # 直下のフォルダ名＝正解クラス
     return None
 
 # ------------------------ 評価ユーティリティ ------------------------
 def build_label_space(y_true: List[str], y_pred: List[str], class_names: List[str], include_unknown: bool):
-    labels = list(class_names)  # まず学習クラス順を尊重
+    labels = list(class_names)
     extra = sorted({*(y_true or []), *(y_pred or [])} - set(labels))
     labels += [l for l in extra if (include_unknown or l != "unknown")]
     if include_unknown and "unknown" not in labels:
@@ -212,7 +210,7 @@ def main():
     ap.add_argument("--img-size", type=int, default=384)
     ap.add_argument("--input", required=True, help="画像ファイル or ディレクトリ（ディレクトリ/クラス名/画像 なら評価可）")
     ap.add_argument("--resize-mode", choices=["pad", "crop", "stretch"], default="pad",
-                    help="pad=レターボックス(推奨) / crop=短辺合わせ+CenterCrop / stretch=強制正方形")
+                    help="pad=レターボックス / crop=短辺合わせ+CenterCrop / stretch=強制正方形")
     ap.add_argument("--bg", choices=["black", "white", "mean"], default="black",
                     help="--resize-mode pad の背景色")
     ap.add_argument("--topk", type=int, default=3)
@@ -246,7 +244,7 @@ def main():
             img = Image.open(img_path).convert("RGB")
         except Exception as e:
             print(f"[WARN] open failed: {img_path} ({e})")
-            continue
+            continue  # ← ここで安全に続行（旧版の 'Image' 参照バグを解消）
 
         probs = predict_probs(model, img, tf, device, tta=args.tta)
         topk = topk_from_probs(probs, class_names, args.topk)
@@ -306,10 +304,7 @@ def main():
             print("[INFO] 評価対象が見つかりませんでした。--input が '親/クラス/画像' 構造であるか確認してください。")
             return
 
-        # ラベル空間
         labels = build_label_space(y_true, y_pred, class_names, include_unknown=args.include_unknown)
-
-        # 混同行列・レポート
         cm = confusion_matrix(y_true, y_pred, labels=labels)
         report = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
         micro_f1 = f1_score(y_true, y_pred, labels=labels, average="micro", zero_division=0)
@@ -317,16 +312,12 @@ def main():
         acc = accuracy_score(y_true, y_pred)
         report["_overall"] = {"accuracy": acc, "micro_f1": micro_f1, "macro_f1": macro_f1, "num_samples": len(y_true)}
 
-        # 保存先
         eval_dir = Path(args.eval_out or "runs/eval_from_predict")
         eval_dir.mkdir(parents=True, exist_ok=True)
 
-        # 保存物
         save_json(report, eval_dir / "report.json")
         save_report_csv(report, labels, eval_dir / "report.csv")
         save_confusion_matrix_csv(cm, labels, eval_dir / "confusion_matrix.csv")
-
-        # 画像（混同行列 & 棒グラフ）
         plot_confusion_matrix(cm, labels, eval_dir / "confusion_matrix.png", normalize=False)
         plot_confusion_matrix(cm, labels, eval_dir / "confusion_matrix_norm.png", normalize=True)
         plot_bars(report, labels, "precision",    eval_dir / "precision_per_class.png")
@@ -334,9 +325,8 @@ def main():
         plot_bars(report, labels, "f1-score",     eval_dir / "f1_per_class.png")
         plot_bars(report, labels, "support",      eval_dir / "support_per_class.png")
 
-        # 誤分類コピー（任意）
         if args.export_miscls:
-            from PIL import Image
+            from PIL import Image  # 明示化
             out_dir = eval_dir / "misclassified"
             out_dir.mkdir(parents=True, exist_ok=True)
             counter: Dict[Tuple[str,str], int] = {}
