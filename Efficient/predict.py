@@ -1,11 +1,11 @@
-# predict.py  (inference + evaluation; robust class extraction; fixed exception)
+# predict.py  (inference + evaluation, robust)
 import argparse, csv, os, shutil, json
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
 import torch
 import timm
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 from torchvision import transforms
 
 import numpy as np
@@ -16,7 +16,7 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
-# ------------------------ 画像のサイズ変更（3モード） ------------------------
+# ---------- 画像サイズ変更 ----------
 def letterbox_pad(img: Image.Image, dst_size: int, bg: str = "black") -> Image.Image:
     w, h = img.size
     if w == 0 or h == 0:
@@ -60,7 +60,7 @@ def build_transform(img_size: int, resize_mode: str, bg: str):
         ])
     return tf
 
-# ------------------------ モデル＆クラス名の読み込み ------------------------
+# ---------- モデル読み込み ----------
 def _infer_num_classes_from_state_dict(state_dict: dict) -> int:
     candidates = []
     for k, v in state_dict.items():
@@ -92,7 +92,7 @@ def load_model(ckpt_path: str, model_name: str, device):
     model.to(device).eval()
     return model, class_names
 
-# ------------------------ データ反復・推論ユーティリティ ------------------------
+# ---------- ユーティリティ ----------
 def iter_images(path: Path):
     if path.is_file():
         if path.suffix.lower() in VALID_EXTS:
@@ -126,18 +126,21 @@ def topk_from_probs(probs: torch.Tensor, class_names: List[str], k: int):
     names = [class_names[i] for i in idx]
     return list(zip(names, conf))
 
-# -------- robust: 親/クラス/画像 の “クラス” を相対パスの最初から取得 --------
 def infer_true_label(img_path: Path, input_root: Path) -> Optional[str]:
+    """
+    input_root/クラス名/画像 のとき、そのクラス名を返す。
+    深い階層でも最上位のサブフォルダ名を真値とみなす（日本語名OK）。
+    """
     try:
         rel = img_path.resolve().relative_to(input_root.resolve())
     except Exception:
         return None
     parts = rel.parts
-    if len(parts) >= 2:
-        return parts[0]            # 直下のフォルダ名＝正解クラス
+    if len(parts) >= 2:   # 少なくとも class/filename
+        return parts[0]
     return None
 
-# ------------------------ 評価ユーティリティ ------------------------
+# ---------- 評価補助 ----------
 def build_label_space(y_true: List[str], y_pred: List[str], class_names: List[str], include_unknown: bool):
     labels = list(class_names)
     extra = sorted({*(y_true or []), *(y_pred or [])} - set(labels))
@@ -202,30 +205,28 @@ def plot_bars(report: Dict, labels: List[str], metric: str, out_png: Path):
     plt.savefig(out_png, dpi=160)
     plt.close()
 
-# ------------------------ メイン ------------------------
+# ---------- メイン ----------
 def main():
-    ap = argparse.ArgumentParser("Predict with EfficientNet-V2 (enhanced + evaluation)")
+    ap = argparse.ArgumentParser("Predict with EfficientNet-V2 (inference + evaluation)")
     ap.add_argument("--ckpt", required=True, help="best.ckpt のパス")
     ap.add_argument("--model", required=True, help="学習時と同じ timm モデル名（例: tf_efficientnetv2_s_in21k_ft_in1k）")
     ap.add_argument("--img-size", type=int, default=384)
-    ap.add_argument("--input", required=True, help="画像ファイル or ディレクトリ（ディレクトリ/クラス名/画像 なら評価可）")
-    ap.add_argument("--resize-mode", choices=["pad", "crop", "stretch"], default="pad",
-                    help="pad=レターボックス / crop=短辺合わせ+CenterCrop / stretch=強制正方形")
-    ap.add_argument("--bg", choices=["black", "white", "mean"], default="black",
-                    help="--resize-mode pad の背景色")
+    ap.add_argument("--input", required=True, help="画像ファイル or ディレクトリ（親/クラス/画像 なら評価可）")
+    ap.add_argument("--resize-mode", choices=["pad", "crop", "stretch"], default="pad")
+    ap.add_argument("--bg", choices=["black", "white", "mean"], default="black")
     ap.add_argument("--topk", type=int, default=3)
-    ap.add_argument("--threshold", type=float, default=0.0,
-                    help="Top-1 確率がこの値未満なら 'unknown' とする (例: 0.6)")
+    ap.add_argument("--threshold", type=float, default=0.0, help="Top-1 確率が未満なら 'unknown'")
     ap.add_argument("--cpu", action="store_true")
-    ap.add_argument("--tta", action="store_true", help="水平反転 TTA を有効化")
-    ap.add_argument("--save-csv", default=None, help="予測結果をCSV保存するパス（例: runs/preds.csv）")
-    ap.add_argument("--save-per-class", default=None, help="予測クラスごとに画像をコピーするディレクトリ")
-    # 評価関連
-    ap.add_argument("--eval", action="store_true", help="入力が クラス/画像 構造の場合に、混同行列とクラス別指標を保存")
+    ap.add_argument("--tta", action="store_true", help="水平反転 TTA")
+    # 保存
+    ap.add_argument("--save-csv", default=None, help="予測をCSV保存（例: runs/preds.csv）")
+    ap.add_argument("--save-per-class", default=None, help="予測クラスごとに画像コピーする先")
+    # 評価
+    ap.add_argument("--eval", action="store_true", help="親/クラス/画像 構造として評価を保存")
     ap.add_argument("--eval-out", default=None, help="評価レポート出力先（例: runs/eval_from_predict）")
     ap.add_argument("--include-unknown", action="store_true", help="unknown を評価に含める")
-    ap.add_argument("--export-miscls", action="store_true", help="誤分類画像を True/Pred 別にコピー保存（--eval時）")
-    ap.add_argument("--miscls-limit", type=int, default=50, help="誤分類コピーの1組み合わせ上限数")
+    ap.add_argument("--export-miscls", action="store_true", help="誤分類を True/Pred 別にコピー")
+    ap.add_argument("--miscls-limit", type=int, default=50)
     args = ap.parse_args()
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
@@ -237,14 +238,18 @@ def main():
     if args.save_per_class:
         Path(args.save_per_class).mkdir(parents=True, exist_ok=True)
 
-    # 推論しながら、必要なら真値(親フォルダ名)も拾う
     y_true, y_pred, paths_for_eval = [], [], []
+
     for img_path in iter_images(inp_root):
+        # --- 画像読込：ここでの例外を丁寧に処理（以前のバグ修正） ---
         try:
             img = Image.open(img_path).convert("RGB")
+        except (UnidentifiedImageError, OSError) as e:
+            print(f"[WARN] open failed (not an image or corrupted): {img_path} ({e})")
+            continue
         except Exception as e:
             print(f"[WARN] open failed: {img_path} ({e})")
-            continue  # ← ここで安全に続行（旧版の 'Image' 参照バグを解消）
+            continue
 
         probs = predict_probs(model, img, tf, device, tta=args.tta)
         topk = topk_from_probs(probs, class_names, args.topk)
@@ -253,7 +258,7 @@ def main():
         if args.threshold > 0.0 and top1_conf < args.threshold:
             pred_name = "unknown"
 
-        # 表示（コンソール）
+        # 表示
         line = ", ".join([f"{n}:{c:.3f}" for n, c in topk])
         suffix = f"  (pred='{pred_name}')" if pred_name != top1_name else ""
         print(f"{img_path.name} -> {line}{suffix}")
@@ -264,7 +269,7 @@ def main():
             row[f"top{i+1}"] = f"{topk[i][0]}:{topk[i][1]:.6f}"
         rows.append(row)
 
-        # 仕分け保存
+        # 予測クラスごとに保存（任意）
         if args.save_per_class:
             dst_dir = Path(args.save_per_class) / pred_name
             dst_dir.mkdir(parents=True, exist_ok=True)
@@ -278,7 +283,7 @@ def main():
             except Exception:
                 img.save(dst_path)
 
-        # 真値（input_root/クラス名/画像 のときのみ）
+        # 真値（親/クラス/画像 構造なら）
         if args.eval:
             gt = infer_true_label(img_path, inp_root)
             if gt is not None:
@@ -298,7 +303,7 @@ def main():
                 w.writerow({k: r.get(k, "") for k in fields})
         print(f"Saved CSV -> {outp}")
 
-    # ---------------- 評価（オプション） ----------------
+    # ---------- 評価 ----------
     if args.eval:
         if not y_true:
             print("[INFO] 評価対象が見つかりませんでした。--input が '親/クラス/画像' 構造であるか確認してください。")
@@ -315,40 +320,39 @@ def main():
         eval_dir = Path(args.eval_out or "runs/eval_from_predict")
         eval_dir.mkdir(parents=True, exist_ok=True)
 
-        save_json(report, eval_dir / "report.json")
+        # 保存
+        def _save_json(o, p): p.write_text(json.dumps(o, indent=2, ensure_ascii=False), encoding="utf-8")
+        _save_json(report, eval_dir / "report.json")
         save_report_csv(report, labels, eval_dir / "report.csv")
         save_confusion_matrix_csv(cm, labels, eval_dir / "confusion_matrix.csv")
         plot_confusion_matrix(cm, labels, eval_dir / "confusion_matrix.png", normalize=False)
         plot_confusion_matrix(cm, labels, eval_dir / "confusion_matrix_norm.png", normalize=True)
-        plot_bars(report, labels, "precision",    eval_dir / "precision_per_class.png")
-        plot_bars(report, labels, "recall",       eval_dir / "recall_per_class.png")
-        plot_bars(report, labels, "f1-score",     eval_dir / "f1_per_class.png")
-        plot_bars(report, labels, "support",      eval_dir / "support_per_class.png")
+        plot_bars(report, labels, "precision", eval_dir / "precision_per_class.png")
+        plot_bars(report, labels, "recall",    eval_dir / "recall_per_class.png")
+        plot_bars(report, labels, "f1-score",  eval_dir / "f1_per_class.png")
+        plot_bars(report, labels, "support",   eval_dir / "support_per_class.png")
 
+        # 誤分類コピー（任意）
         if args.export_miscls:
-            from PIL import Image  # 明示化
             out_dir = eval_dir / "misclassified"
             out_dir.mkdir(parents=True, exist_ok=True)
             counter: Dict[Tuple[str,str], int] = {}
             for p, t, pr in zip(paths_for_eval, y_true, y_pred):
-                if t == pr:
+                if t == pr: 
                     continue
                 key = (t, pr)
                 counter[key] = counter.get(key, 0) + 1
-                if counter[key] > args.miscls_limit:
+                if counter[key] > args.miscls_limit: 
                     continue
                 try:
                     im = Image.open(p).convert("RGB")
-                except Exception:
-                    continue
-                pair_dir = out_dir / f"true_{t}__pred_{pr}"
-                pair_dir.mkdir(parents=True, exist_ok=True)
-                dst = pair_dir / Path(p).name
-                i = 1
-                while dst.exists():
-                    dst = pair_dir / f"{Path(p).stem}_{i}{Path(p).suffix}"
-                    i += 1
-                try:
+                    pair_dir = out_dir / f"true_{t}__pred_{pr}"
+                    pair_dir.mkdir(parents=True, exist_ok=True)
+                    dst = pair_dir / Path(p).name
+                    i = 1
+                    while dst.exists():
+                        dst = pair_dir / f"{Path(p).stem}_{i}{Path(p).suffix}"
+                        i += 1
                     im.save(dst)
                 except Exception:
                     pass
@@ -357,3 +361,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
