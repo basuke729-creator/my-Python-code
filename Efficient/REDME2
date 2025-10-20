@@ -55,3 +55,12 @@ python predict.py \
   --eval --eval-out "runs/eval_from_predict" \
   --export-miscls --miscls-limit 50
 
+python predict.py \
+  --ckpt "runs/effv2_s_phaseB/best.ckpt" \
+  --model tf_efficientnetv2_s_in21k_ft_in1k \
+  --img-size 384 \
+  --input "cls_dataset_test/test" \
+  --resize-mode pad --bg black \
+  --eval --eval-out "runs/eval_from_predict" \
+  --save-csv "runs/preds.csv" --save-per-class "runs/preds_split"
+

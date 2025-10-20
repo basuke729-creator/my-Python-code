@@ -1,5 +1,5 @@
-# predict.py  (inference + evaluation, JP font & annotated confusion matrix)
-# v1.5
+# predict.py  (inference + evaluation, JP font & annotated CM, per-class summary)
+# v1.6
 import argparse, csv, os, shutil, json
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
 
-print("predict.py v1.5 (JP font & annotated CM)")
+print("predict.py v1.6 (per-class summary)")
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -23,10 +23,6 @@ VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 # ------------------------ フォント設定（日本語対応） ------------------------
 def set_japanese_font(font_path: str = ""):
-    """
-    日本語ラベルの文字化けを防ぐため、matplotlib に日本語フォントを設定する。
-    --font にパスがあればそれを優先。無ければ候補から自動検出。
-    """
     try:
         if font_path and Path(font_path).exists():
             fp = font_manager.FontProperties(fname=font_path)
@@ -42,9 +38,9 @@ def set_japanese_font(font_path: str = ""):
                 matplotlib.rcParams["font.family"] = name
                 return
     except Exception:
-        pass  # 見つからなければ英数字フォントのまま
+        pass
 
-# ------------------------ 画像のサイズ変更（3モード） ------------------------
+# ------------------------ 画像のサイズ変更 ------------------------
 def letterbox_pad(img: Image.Image, dst_size: int, bg: str = "black") -> Image.Image:
     w, h = img.size
     if w == 0 or h == 0:
@@ -80,7 +76,7 @@ def build_transform(img_size: int, resize_mode: str, bg: str):
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
-    else:  # stretch
+    else:
         tf = transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
@@ -88,7 +84,7 @@ def build_transform(img_size: int, resize_mode: str, bg: str):
         ])
     return tf
 
-# ------------------------ モデル＆クラス名の読み込み ------------------------
+# ------------------------ モデル読み込み ------------------------
 def _infer_num_classes_from_state_dict(state_dict: dict) -> int:
     candidates = []
     for k, v in state_dict.items():
@@ -96,8 +92,7 @@ def _infer_num_classes_from_state_dict(state_dict: dict) -> int:
             continue
         bias_key = k.replace("weight", "bias")
         if bias_key in state_dict and getattr(state_dict[bias_key], "ndim", 0) == 1:
-            out_dim = v.shape[0]
-            candidates.append((k, out_dim))
+            candidates.append((k, v.shape[0]))
     if not candidates:
         lin_dims = [v.shape[0] for k, v in state_dict.items() if k.endswith("weight") and getattr(v, "ndim", 0) == 2]
         if lin_dims:
@@ -119,7 +114,7 @@ def load_model(ckpt_path: str, model_name: str, device):
     model.to(device).eval()
     return model, class_names
 
-# ------------------------ データ反復・推論ユーティリティ ------------------------
+# ------------------------ 推論ユーティリティ ------------------------
 def iter_images(path: Path):
     if path.is_file():
         if path.suffix.lower() in VALID_EXTS:
@@ -152,10 +147,6 @@ def topk_from_probs(probs: torch.Tensor, class_names: List[str], k: int):
     return list(zip(names, conf))
 
 def infer_true_label(img_path: Path, input_root: Path) -> Optional[str]:
-    """
-    input_root/クラス名/画像 のとき、そのクラス名を返す。
-    深い階層でも最上位のサブフォルダ名を真値とみなす。
-    """
     try:
         rel = img_path.resolve().relative_to(input_root.resolve())
     except Exception:
@@ -200,12 +191,6 @@ def save_confusion_matrix_csv(cm: np.ndarray, labels: List[str], out_csv: Path):
 
 def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_png: Path,
                           normalize: bool = False, cmap: str = "Blues"):
-    """
-    日本語フォント対応＋各マスに注釈（数値/割合）を描画した混同行列を保存。
-    normalize=True のときは行正規化し、注釈は百分率表示。
-    """
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-
     m = cm.astype(np.float32)
     ann = m.copy()
     title = "Confusion Matrix"
@@ -229,54 +214,43 @@ def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_png: Path,
     plt.xlabel("Predicted")
     plt.ylabel("True")
 
-    # 中央より濃いセルは白文字、薄いセルは黒文字
     thresh = m.max() / 2.0 if m.size > 0 else 0.5
     for i in range(len(labels)):
         for j in range(len(labels)):
-            text = f"{ann[i, j]:.1f}" if normalize else f"{int(ann[i, j])}"
+            text = f"{ann[i, j]:.1f}" if normalize else f"( {int(ann[i, j])} )"
             color = "white" if m[i, j] > thresh else "black"
             plt.text(j, i, text, ha="center", va="center", color=color, fontsize=9)
 
     plt.tight_layout()
-    plt.savefig(out_png, dpi=200)
-    plt.close()
-
-def plot_bars(report: Dict, labels: List[str], metric: str, out_png: Path):
-    vals = [report.get(c, {}).get(metric, 0.0) for c in labels]
-    plt.figure(figsize=(max(6, len(labels)*0.6), 4.5))
-    plt.bar(range(len(labels)), vals)
-    plt.xticks(range(len(labels)), labels, rotation=60, ha="right")
-    plt.ylabel(metric)
-    plt.title(f"Per-class {metric}")
-    plt.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_png, dpi=160)
+    plt.savefig(out_png, dpi=200)
     plt.close()
 
 # ------------------------ メイン ------------------------
 def main():
     ap = argparse.ArgumentParser("Predict with EfficientNet-V2 (inference + evaluation)")
-    ap.add_argument("--ckpt", required=True, help="best.ckpt のパス")
-    ap.add_argument("--model", required=True, help="学習時と同じ timm モデル名（例: tf_efficientnetv2_s_in21k_ft_in1k）")
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--model", required=True)
     ap.add_argument("--img-size", type=int, default=384)
-    ap.add_argument("--input", required=True, help="画像ファイル or ディレクトリ（親/クラス/画像 なら評価可）")
+    ap.add_argument("--input", required=True)
     ap.add_argument("--resize-mode", choices=["pad", "crop", "stretch"], default="pad")
     ap.add_argument("--bg", choices=["black", "white", "mean"], default="black")
     ap.add_argument("--topk", type=int, default=3)
-    ap.add_argument("--threshold", type=float, default=0.0, help="Top-1 確率が未満なら 'unknown'")
+    ap.add_argument("--threshold", type=float, default=0.0)
     ap.add_argument("--cpu", action="store_true")
-    ap.add_argument("--tta", action="store_true", help="水平反転 TTA")
-    # 保存
-    ap.add_argument("--save-csv", default=None, help="予測をCSV保存（例: runs/preds.csv）")
-    ap.add_argument("--save-per-class", default=None, help="予測クラスごとに画像コピーする先")
+    ap.add_argument("--tta", action="store_true")
+    # 出力
+    ap.add_argument("--save-csv", default=None)
+    ap.add_argument("--save-per-class", default=None)
     # 評価
-    ap.add_argument("--eval", action="store_true", help="親/クラス/画像 構造として評価を保存")
-    ap.add_argument("--eval-out", default=None, help="評価レポート出力先（例: runs/eval_from_predict）")
-    ap.add_argument("--include-unknown", action="store_true", help="unknown を評価に含める")
-    ap.add_argument("--export-miscls", action="store_true", help="誤分類を True/Pred 別にコピー")
+    ap.add_argument("--eval", action="store_true")
+    ap.add_argument("--eval-out", default=None)
+    ap.add_argument("--include-unknown", action="store_true")
+    ap.add_argument("--export-miscls", action="store_true")
     ap.add_argument("--miscls-limit", type=int, default=50)
-    # 日本語フォント（任意）
-    ap.add_argument("--font", default="", help="日本語表示用フォントのパス（指定が無ければ自動検出）")
+    ap.add_argument("--font", default="")
+    # 追加：1枚ごとのログを抑制（デフォルトOFF）
+    ap.add_argument("--per-image", action="store_true", help="各画像の推論ログを表示したい場合に指定")
     args = ap.parse_args()
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
@@ -289,39 +263,39 @@ def main():
         Path(args.save_per_class).mkdir(parents=True, exist_ok=True)
 
     y_true, y_pred, paths_for_eval = [], [], []
+    total_seen = 0
 
     for img_path in iter_images(inp_root):
-        # --- 画像読込（例外を安全に処理：過去の 'Image' 参照バグを解消） ---
         try:
             with open(img_path, "rb") as fh:
-                img = Image.open(fh)
-                img = img.convert("RGB")
+                img = Image.open(fh).convert("RGB")
         except (UnidentifiedImageError, OSError):
-            print(f"[WARN] open failed: {img_path}")
+            if args.per_image:
+                print(f"[WARN] open failed: {img_path}")
             continue
         except Exception:
-            print(f"[WARN] open failed: {img_path}")
+            if args.per_image:
+                print(f"[WARN] open failed: {img_path}")
             continue
 
         probs = predict_probs(model, img, tf, device, tta=args.tta)
         topk = topk_from_probs(probs, class_names, args.topk)
         top1_name, top1_conf = topk[0]
-        pred_name = top1_name
-        if args.threshold > 0.0 and top1_conf < args.threshold:
-            pred_name = "unknown"
+        pred_name = top1_name if (args.threshold == 0.0 or top1_conf >= args.threshold) else "unknown"
 
-        # 表示
-        line = ", ".join([f"{n}:{c:.3f}" for n, c in topk])
-        suffix = f"  (pred='{pred_name}')" if pred_name != top1_name else ""
-        print(f"{img_path.name} -> {line}{suffix}")
+        if args.per_image:
+            line = ", ".join([f"{n}:{c:.3f}" for n, c in topk])
+            suffix = f"  (pred='{pred_name}')" if pred_name != top1_name else ""
+            print(f"{img_path.name} -> {line}{suffix}")
 
-        # CSV 行
-        row = {"path": str(img_path), "pred": pred_name, "top1": f"{topk[0][0]}:{topk[0][1]:.6f}"}
-        for i in range(1, min(3, len(topk))):
-            row[f"top{i+1}"] = f"{topk[i][0]}:{topk[i][1]:.6f}"
-        rows.append(row)
+        rows.append({
+            "path": str(img_path),
+            "pred": pred_name,
+            "top1": f"{topk[0][0]}:{topk[0][1]:.6f}",
+            "top2": f"{topk[1][0]}:{topk[1][1]:.6f}" if len(topk) > 1 else "",
+            "top3": f"{topk[2][0]}:{topk[2][1]:.6f}" if len(topk) > 2 else "",
+        })
 
-        # 予測クラスごとに保存（任意）
         if args.save_per_class:
             dst_dir = Path(args.save_per_class) / pred_name
             dst_dir.mkdir(parents=True, exist_ok=True)
@@ -335,36 +309,35 @@ def main():
             except Exception:
                 img.save(dst_path)
 
-        # 真値（親/クラス/画像 構造なら）
         if args.eval:
             gt = infer_true_label(img_path, inp_root)
             if gt is not None:
                 y_true.append(gt)
                 y_pred.append(pred_name)
                 paths_for_eval.append(str(img_path))
+        total_seen += 1
 
     # CSV 保存
     if args.save_csv:
         outp = Path(args.save_csv)
         outp.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["path", "pred", "top1", "top2", "top3"]
         with open(outp, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
+            w = csv.DictWriter(f, fieldnames=["path","pred","top1","top2","top3"])
             w.writeheader()
             for r in rows:
-                w.writerow({k: r.get(k, "") for k in fields})
+                w.writerow(r)
         print(f"Saved CSV -> {outp}")
 
-    # ---------------- 評価 ----------------
+    # ---------------- 評価＆コンソール要約 ----------------
     if args.eval:
         if not y_true:
-            print("[INFO] 評価対象が見つかりませんでした。--input が '親/クラス/画像' 構造であるか確認してください。")
+            print("[INFO] 評価対象が見つかりませんでした。--input が '親/クラス/画像' 構造か確認してください。")
             return
 
-        # 日本語フォント設定（最初に1回）
         set_japanese_font(args.font)
-
         labels = build_label_space(y_true, y_pred, class_names, include_unknown=args.include_unknown)
+
+        # 混同行列
         cm = confusion_matrix(y_true, y_pred, labels=labels)
         report = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
         micro_f1 = f1_score(y_true, y_pred, labels=labels, average="micro", zero_division=0)
@@ -374,30 +347,24 @@ def main():
 
         eval_dir = Path(args.eval_out or "runs/eval_from_predict")
         eval_dir.mkdir(parents=True, exist_ok=True)
-
-        # 保存
         save_json(report, eval_dir / "report.json")
         save_report_csv(report, labels, eval_dir / "report.csv")
         save_confusion_matrix_csv(cm, labels, eval_dir / "confusion_matrix.csv")
-        # 画像（非正規化＆正規化の2種類を保存。各マスに注釈付き）
         plot_confusion_matrix(cm, labels, eval_dir / "confusion_matrix.png", normalize=False)
         plot_confusion_matrix(cm, labels, eval_dir / "confusion_matrix_norm.png", normalize=True)
 
-        # クラス別グラフ
-        def plot_bars(metric: str, fname: str):
-            vals = [report.get(c, {}).get(metric, 0.0) for c in labels]
-            plt.figure(figsize=(max(6, len(labels)*0.6), 4.5))
-            plt.bar(range(len(labels)), vals)
-            plt.xticks(range(len(labels)), labels, rotation=60, ha="right")
-            plt.ylabel(metric)
-            plt.title(f"Per-class {metric}")
-            plt.tight_layout()
-            plt.savefig(eval_dir / fname, dpi=160)
-            plt.close()
-        plot_bars("precision", "precision_per_class.png")
-        plot_bars("recall",    "recall_per_class.png")
-        plot_bars("f1-score",  "f1_per_class.png")
-        plot_bars("support",   "support_per_class.png")
+        # --- ここが新規：クラス別正解率（= 行の正解数 / 行の合計）をコンソールにまとめて表示 ---
+        totals = cm.sum(axis=1)            # 各真値クラスの枚数
+        corrects = np.diag(cm)             # 各クラスの正解数
+        per_class_acc = np.divide(corrects, np.maximum(totals, 1), out=np.zeros_like(corrects, dtype=float), where=totals>0)
+
+        print("\n=== Per-class Accuracy (真値ベース) ===")
+        width = max(len(s) for s in labels) if labels else 10
+        print(f"{'class'.ljust(width)}  {'acc':>6}  {'correct':>7} / {'total':<7}")
+        for i, name in enumerate(labels):
+            print(f"{name.ljust(width)}  {per_class_acc[i]*100:6.2f}%  {int(corrects[i]):7d} / {int(totals[i]):<7d}")
+        print(f"\nOverall accuracy: {acc*100:.2f}%   (samples: {len(y_true)})")
+        print(f"Macro-F1: {macro_f1:.4f}  Micro-F1: {micro_f1:.4f}")
 
         # 誤分類コピー（任意）
         if args.export_miscls:
@@ -405,11 +372,11 @@ def main():
             out_dir.mkdir(parents=True, exist_ok=True)
             counter: Dict[Tuple[str,str], int] = {}
             for p, t, pr in zip(paths_for_eval, y_true, y_pred):
-                if t == pr:
+                if t == pr: 
                     continue
                 key = (t, pr)
                 counter[key] = counter.get(key, 0) + 1
-                if counter[key] > args.miscls_limit:
+                if counter[key] > args.miscls_limit: 
                     continue
                 try:
                     im = Image.open(p).convert("RGB")
@@ -425,6 +392,9 @@ def main():
                     pass
 
         print(f"[OK] Evaluation saved to: {eval_dir}")
+    else:
+        print(f"[DONE] processed images: {total_seen}")
 
 if __name__ == "__main__":
     main()
+
