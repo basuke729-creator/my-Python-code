@@ -1,4 +1,5 @@
-# predict.py  (inference + evaluation, robust)
+# predict.py  (inference + evaluation, JP font & annotated confusion matrix)
+# v1.5
 import argparse, csv, os, shutil, json
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -9,14 +10,41 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from torchvision import transforms
 
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+
+print("predict.py v1.5 (JP font & annotated CM)")
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
-# ---------- 画像サイズ変更 ----------
+# ------------------------ フォント設定（日本語対応） ------------------------
+def set_japanese_font(font_path: str = ""):
+    """
+    日本語ラベルの文字化けを防ぐため、matplotlib に日本語フォントを設定する。
+    --font にパスがあればそれを優先。無ければ候補から自動検出。
+    """
+    try:
+        if font_path and Path(font_path).exists():
+            fp = font_manager.FontProperties(fname=font_path)
+            matplotlib.rcParams["font.family"] = fp.get_name()
+            return
+        candidates = [
+            "Noto Sans CJK JP", "Noto Sans JP", "Noto Sans CJK JP Regular",
+            "IPAexGothic", "IPAGothic", "TakaoPGothic", "VL PGothic"
+        ]
+        avail = {f.name for f in font_manager.fontManager.ttflist}
+        for name in candidates:
+            if name in avail:
+                matplotlib.rcParams["font.family"] = name
+                return
+    except Exception:
+        pass  # 見つからなければ英数字フォントのまま
+
+# ------------------------ 画像のサイズ変更（3モード） ------------------------
 def letterbox_pad(img: Image.Image, dst_size: int, bg: str = "black") -> Image.Image:
     w, h = img.size
     if w == 0 or h == 0:
@@ -60,7 +88,7 @@ def build_transform(img_size: int, resize_mode: str, bg: str):
         ])
     return tf
 
-# ---------- モデル読み込み ----------
+# ------------------------ モデル＆クラス名の読み込み ------------------------
 def _infer_num_classes_from_state_dict(state_dict: dict) -> int:
     candidates = []
     for k, v in state_dict.items():
@@ -86,13 +114,12 @@ def load_model(ckpt_path: str, model_name: str, device):
     else:
         num_classes = _infer_num_classes_from_state_dict(state)
         class_names = [str(i) for i in range(num_classes)]
-
     model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
     model.load_state_dict(state, strict=True)
     model.to(device).eval()
     return model, class_names
 
-# ---------- ユーティリティ ----------
+# ------------------------ データ反復・推論ユーティリティ ------------------------
 def iter_images(path: Path):
     if path.is_file():
         if path.suffix.lower() in VALID_EXTS:
@@ -107,7 +134,6 @@ def predict_probs(model, img: Image.Image, tf, device, tta: bool = False) -> tor
     with torch.no_grad():
         logits = model(x)
         probs = torch.softmax(logits, dim=1)
-
     if tta:
         img_hf = ImageOps.mirror(img)
         x2 = tf(img_hf).unsqueeze(0).to(device)
@@ -115,7 +141,6 @@ def predict_probs(model, img: Image.Image, tf, device, tta: bool = False) -> tor
             logits2 = model(x2)
             probs2 = torch.softmax(logits2, dim=1)
         probs = (probs + probs2) / 2.0
-
     return probs.squeeze(0).cpu()
 
 def topk_from_probs(probs: torch.Tensor, class_names: List[str], k: int):
@@ -129,18 +154,18 @@ def topk_from_probs(probs: torch.Tensor, class_names: List[str], k: int):
 def infer_true_label(img_path: Path, input_root: Path) -> Optional[str]:
     """
     input_root/クラス名/画像 のとき、そのクラス名を返す。
-    深い階層でも最上位のサブフォルダ名を真値とみなす（日本語名OK）。
+    深い階層でも最上位のサブフォルダ名を真値とみなす。
     """
     try:
         rel = img_path.resolve().relative_to(input_root.resolve())
     except Exception:
         return None
     parts = rel.parts
-    if len(parts) >= 2:   # 少なくとも class/filename
+    if len(parts) >= 2:
         return parts[0]
     return None
 
-# ---------- 評価補助 ----------
+# ------------------------ 評価ユーティリティ ------------------------
 def build_label_space(y_true: List[str], y_pred: List[str], class_names: List[str], include_unknown: bool):
     labels = list(class_names)
     extra = sorted({*(y_true or []), *(y_pred or [])} - set(labels))
@@ -173,24 +198,47 @@ def save_confusion_matrix_csv(cm: np.ndarray, labels: List[str], out_csv: Path):
         for i, r in enumerate(cm):
             w.writerow([labels[i]] + list(r))
 
-def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_png: Path, normalize: bool = False):
+def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_png: Path,
+                          normalize: bool = False, cmap: str = "Blues"):
+    """
+    日本語フォント対応＋各マスに注釈（数値/割合）を描画した混同行列を保存。
+    normalize=True のときは行正規化し、注釈は百分率表示。
+    """
     out_png.parent.mkdir(parents=True, exist_ok=True)
+
     m = cm.astype(np.float32)
+    ann = m.copy()
+    title = "Confusion Matrix"
     if normalize:
         row_sums = m.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1.0
         m = m / row_sums
-    plt.figure(figsize=(max(6, len(labels)*0.6), max(5, len(labels)*0.5)))
-    plt.imshow(m, interpolation="nearest")
-    plt.title("Confusion Matrix" + (" (normalized)" if normalize else ""))
-    plt.colorbar()
-    ticks = np.arange(len(labels))
-    plt.xticks(ticks, labels, rotation=60, ha="right")
-    plt.yticks(ticks, labels)
+        ann = m * 100.0
+        title += " (normalized, %) "
+
+    fig_w = max(6, len(labels) * 0.7)
+    fig_h = max(5, len(labels) * 0.6)
+    plt.figure(figsize=(fig_w, fig_h))
+    im = plt.imshow(m, interpolation="nearest", cmap=cmap)
+    plt.title(title)
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+
+    tick_idx = np.arange(len(labels))
+    plt.xticks(tick_idx, labels, rotation=60, ha="right")
+    plt.yticks(tick_idx, labels)
     plt.xlabel("Predicted")
     plt.ylabel("True")
+
+    # 中央より濃いセルは白文字、薄いセルは黒文字
+    thresh = m.max() / 2.0 if m.size > 0 else 0.5
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            text = f"{ann[i, j]:.1f}" if normalize else f"{int(ann[i, j])}"
+            color = "white" if m[i, j] > thresh else "black"
+            plt.text(j, i, text, ha="center", va="center", color=color, fontsize=9)
+
     plt.tight_layout()
-    plt.savefig(out_png, dpi=160)
+    plt.savefig(out_png, dpi=200)
     plt.close()
 
 def plot_bars(report: Dict, labels: List[str], metric: str, out_png: Path):
@@ -205,7 +253,7 @@ def plot_bars(report: Dict, labels: List[str], metric: str, out_png: Path):
     plt.savefig(out_png, dpi=160)
     plt.close()
 
-# ---------- メイン ----------
+# ------------------------ メイン ------------------------
 def main():
     ap = argparse.ArgumentParser("Predict with EfficientNet-V2 (inference + evaluation)")
     ap.add_argument("--ckpt", required=True, help="best.ckpt のパス")
@@ -227,6 +275,8 @@ def main():
     ap.add_argument("--include-unknown", action="store_true", help="unknown を評価に含める")
     ap.add_argument("--export-miscls", action="store_true", help="誤分類を True/Pred 別にコピー")
     ap.add_argument("--miscls-limit", type=int, default=50)
+    # 日本語フォント（任意）
+    ap.add_argument("--font", default="", help="日本語表示用フォントのパス（指定が無ければ自動検出）")
     args = ap.parse_args()
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
@@ -241,14 +291,16 @@ def main():
     y_true, y_pred, paths_for_eval = [], [], []
 
     for img_path in iter_images(inp_root):
-        # --- 画像読込：ここでの例外を丁寧に処理（以前のバグ修正） ---
+        # --- 画像読込（例外を安全に処理：過去の 'Image' 参照バグを解消） ---
         try:
-            img = Image.open(img_path).convert("RGB")
-        except (UnidentifiedImageError, OSError) as e:
-            print(f"[WARN] open failed (not an image or corrupted): {img_path} ({e})")
+            with open(img_path, "rb") as fh:
+                img = Image.open(fh)
+                img = img.convert("RGB")
+        except (UnidentifiedImageError, OSError):
+            print(f"[WARN] open failed: {img_path}")
             continue
-        except Exception as e:
-            print(f"[WARN] open failed: {img_path} ({e})")
+        except Exception:
+            print(f"[WARN] open failed: {img_path}")
             continue
 
         probs = predict_probs(model, img, tf, device, tta=args.tta)
@@ -303,11 +355,14 @@ def main():
                 w.writerow({k: r.get(k, "") for k in fields})
         print(f"Saved CSV -> {outp}")
 
-    # ---------- 評価 ----------
+    # ---------------- 評価 ----------------
     if args.eval:
         if not y_true:
             print("[INFO] 評価対象が見つかりませんでした。--input が '親/クラス/画像' 構造であるか確認してください。")
             return
+
+        # 日本語フォント設定（最初に1回）
+        set_japanese_font(args.font)
 
         labels = build_label_space(y_true, y_pred, class_names, include_unknown=args.include_unknown)
         cm = confusion_matrix(y_true, y_pred, labels=labels)
@@ -321,16 +376,28 @@ def main():
         eval_dir.mkdir(parents=True, exist_ok=True)
 
         # 保存
-        def _save_json(o, p): p.write_text(json.dumps(o, indent=2, ensure_ascii=False), encoding="utf-8")
-        _save_json(report, eval_dir / "report.json")
+        save_json(report, eval_dir / "report.json")
         save_report_csv(report, labels, eval_dir / "report.csv")
         save_confusion_matrix_csv(cm, labels, eval_dir / "confusion_matrix.csv")
+        # 画像（非正規化＆正規化の2種類を保存。各マスに注釈付き）
         plot_confusion_matrix(cm, labels, eval_dir / "confusion_matrix.png", normalize=False)
         plot_confusion_matrix(cm, labels, eval_dir / "confusion_matrix_norm.png", normalize=True)
-        plot_bars(report, labels, "precision", eval_dir / "precision_per_class.png")
-        plot_bars(report, labels, "recall",    eval_dir / "recall_per_class.png")
-        plot_bars(report, labels, "f1-score",  eval_dir / "f1_per_class.png")
-        plot_bars(report, labels, "support",   eval_dir / "support_per_class.png")
+
+        # クラス別グラフ
+        def plot_bars(metric: str, fname: str):
+            vals = [report.get(c, {}).get(metric, 0.0) for c in labels]
+            plt.figure(figsize=(max(6, len(labels)*0.6), 4.5))
+            plt.bar(range(len(labels)), vals)
+            plt.xticks(range(len(labels)), labels, rotation=60, ha="right")
+            plt.ylabel(metric)
+            plt.title(f"Per-class {metric}")
+            plt.tight_layout()
+            plt.savefig(eval_dir / fname, dpi=160)
+            plt.close()
+        plot_bars("precision", "precision_per_class.png")
+        plot_bars("recall",    "recall_per_class.png")
+        plot_bars("f1-score",  "f1_per_class.png")
+        plot_bars("support",   "support_per_class.png")
 
         # 誤分類コピー（任意）
         if args.export_miscls:
@@ -338,11 +405,11 @@ def main():
             out_dir.mkdir(parents=True, exist_ok=True)
             counter: Dict[Tuple[str,str], int] = {}
             for p, t, pr in zip(paths_for_eval, y_true, y_pred):
-                if t == pr: 
+                if t == pr:
                     continue
                 key = (t, pr)
                 counter[key] = counter.get(key, 0) + 1
-                if counter[key] > args.miscls_limit: 
+                if counter[key] > args.miscls_limit:
                     continue
                 try:
                     im = Image.open(p).convert("RGB")
@@ -361,4 +428,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
