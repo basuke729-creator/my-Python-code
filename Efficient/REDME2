@@ -64,3 +64,20 @@ python predict.py \
   --eval --eval-out "runs/eval_from_predict" \
   --save-csv "runs/preds.csv" --save-per-class "runs/preds_split"
 
+python train_effnetv2.py \
+  --data "./cls_dataset" \
+  --out "./runs/effv2_s_1phase" \
+  --model tf_efficientnetv2_s_in21k_ft_in1k \
+  --img-size 384 \
+  --batch-size 32 \
+  --epochs 30 \
+  --lr 1e-4 \
+  --head-lr-mult 10 \
+  --warmup-epochs 5 \
+  --min-lr 1e-6 \
+  --wd 1e-4 \
+  --aug light \
+  --label-smoothing 0.1 \
+  --weighted-sampler --weighted-loss \
+  --amp
+
