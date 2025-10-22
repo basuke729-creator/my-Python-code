@@ -1,6 +1,6 @@
-# predict.py  (inference + evaluation, JP font & annotated CM, per-class summary)
-# v1.6
-import argparse, csv, os, shutil, json
+# predict.py  (inference + evaluation + speed report)
+# v1.7
+import argparse, csv, os, shutil, json, time
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
 
-print("predict.py v1.6 (per-class summary)")
+print("predict.py v1.7 (per-class summary + speed)")
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -228,7 +228,7 @@ def plot_confusion_matrix(cm: np.ndarray, labels: List[str], out_png: Path,
 
 # ------------------------ メイン ------------------------
 def main():
-    ap = argparse.ArgumentParser("Predict with EfficientNet-V2 (inference + evaluation)")
+    ap = argparse.ArgumentParser("Predict with EfficientNet-V2 (inference + evaluation + speed)")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--img-size", type=int, default=384)
@@ -249,12 +249,17 @@ def main():
     ap.add_argument("--export-miscls", action="store_true")
     ap.add_argument("--miscls-limit", type=int, default=50)
     ap.add_argument("--font", default="")
-    # 追加：1枚ごとのログを抑制（デフォルトOFF）
-    ap.add_argument("--per-image", action="store_true", help="各画像の推論ログを表示したい場合に指定")
+    # 1枚ごとのログを表示したい場合
+    ap.add_argument("--per-image", action="store_true")
+    # 速度計測
+    ap.add_argument("--speed", action="store_true", help="推論速度を計測して要約を表示")
+    ap.add_argument("--speed-csv", default=None, help="速度を per-image でCSV保存するパス")
+    ap.add_argument("--warmup", type=int, default=5, help="最初のN枚は計測から除外（GPU起動やキャッシュの安定化）")
+    ap.add_argument("--no-sync", action="store_true", help="CUDA同期を行わない（粗い計測）。精密計測は未指定が推奨。")
     args = ap.parse_args()
 
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
-    tf = build_transform(args.img_size, args.resize_mode, args.bg)
+    tf = build_transform(args.img_size, args.resize-mode if hasattr(args,'resize-mode') else args.resize_mode, args.bg)
     model, class_names = load_model(args.ckpt, args.model, device)
 
     inp_root = Path(args.input)
@@ -265,6 +270,18 @@ def main():
     y_true, y_pred, paths_for_eval = [], [], []
     total_seen = 0
 
+    # 計測バッファ
+    prep_ms_list, infer_ms_list, total_ms_list = [], [], []
+    if args.speed and args.speed_csv:
+        Path(args.speed_csv).parent.mkdir(parents=True, exist_ok=True)
+        sp_f = open(args.speed_csv, "w", newline="", encoding="utf-8")
+        sp_w = csv.writer(sp_f)
+        sp_w.writerow(["path", "prep_ms", "infer_ms", "total_ms"])
+    else:
+        sp_f = None
+        sp_w = None
+
+    # 画像ループ
     for img_path in iter_images(inp_root):
         try:
             with open(img_path, "rb") as fh:
@@ -278,8 +295,46 @@ def main():
                 print(f"[WARN] open failed: {img_path}")
             continue
 
-        probs = predict_probs(model, img, tf, device, tta=args.tta)
-        topk = topk_from_probs(probs, class_names, args.topk)
+        # ---- 計測開始（前処理 + 推論）----
+        t0 = time.perf_counter()
+        x = tf(img).unsqueeze(0).to(device)
+        t1 = time.perf_counter()
+
+        with torch.no_grad():
+            logits = model(x)
+        if device.type == "cuda" and not args.no_sync:
+            torch.cuda.synchronize()
+        t2 = time.perf_counter()
+
+        probs = torch.softmax(logits, dim=1).squeeze(0).cpu()
+        if args.tta:
+            img_hf = ImageOps.mirror(img)
+            x2 = tf(img_hf).unsqueeze(0).to(device)
+            with torch.no_grad():
+                logits2 = model(x2)
+            if device.type == "cuda" and not args.no_sync:
+                torch.cuda.synchronize()
+            probs = (probs + torch.softmax(logits2, dim=1).squeeze(0).cpu()) / 2.0
+            t2 = time.perf_counter()  # TTA分を含めて終了時間更新
+
+        prep_ms = (t1 - t0) * 1000.0
+        infer_ms = (t2 - t1) * 1000.0
+        total_ms = (t2 - t0) * 1000.0
+
+        # ウォームアップ分は統計に入れない
+        if args.speed and total_seen >= args.warmup:
+            prep_ms_list.append(prep_ms)
+            infer_ms_list.append(infer_ms)
+            total_ms_list.append(total_ms)
+            if sp_w:
+                sp_w.writerow([str(img_path), f"{prep_ms:.3f}", f"{infer_ms:.3f}", f"{total_ms:.3f}"])
+
+        # 予測処理（トップK・しきい値）
+        k = min(args.topk, probs.numel())
+        conf, idx = torch.topk(probs, k)
+        conf = conf.tolist(); idx = idx.tolist()
+        names = [class_names[i] for i in idx]
+        topk = list(zip(names, conf))
         top1_name, top1_conf = topk[0]
         pred_name = top1_name if (args.threshold == 0.0 or top1_conf >= args.threshold) else "unknown"
 
@@ -300,10 +355,10 @@ def main():
             dst_dir = Path(args.save_per_class) / pred_name
             dst_dir.mkdir(parents=True, exist_ok=True)
             dst_path = dst_dir / img_path.name
-            k = 1
+            kdup = 1
             while dst_path.exists():
-                dst_path = dst_dir / f"{img_path.stem}_{k}{img_path.suffix}"
-                k += 1
+                dst_path = dst_dir / f"{img_path.stem}_{kdup}{img_path.suffix}"
+                kdup += 1
             try:
                 shutil.copy2(img_path, dst_path)
             except Exception:
@@ -317,6 +372,9 @@ def main():
                 paths_for_eval.append(str(img_path))
         total_seen += 1
 
+    if sp_f:
+        sp_f.close()
+
     # CSV 保存
     if args.save_csv:
         outp = Path(args.save_csv)
@@ -328,7 +386,31 @@ def main():
                 w.writerow(r)
         print(f"Saved CSV -> {outp}")
 
-    # ---------------- 評価＆コンソール要約 ----------------
+    # 速度要約の表示
+    if args.speed and len(total_ms_list) > 0:
+        def stats(x):
+            x = np.array(x, dtype=np.float64)
+            return dict(
+                mean=float(x.mean()),
+                p50=float(np.percentile(x, 50)),
+                p90=float(np.percentile(x, 90)),
+                p95=float(np.percentile(x, 95)),
+                p99=float(np.percentile(x, 99)),
+            )
+        s_prep = stats(prep_ms_list)
+        s_infer = stats(infer_ms_list)
+        s_total = stats(total_ms_list)
+        imgs = len(total_ms_list)
+        sec = sum(total_ms_list) / 1000.0
+        ips = imgs / sec if sec > 0 else 0.0
+
+        print("\n=== Inference Speed (warmup除外) ===")
+        print(f"samples: {imgs}  total_time: {sec:.3f}s  throughput: {ips:.2f} img/s")
+        print(f"preprocess ms -> mean {s_prep['mean']:.2f} | p50 {s_prep['p50']:.2f} | p95 {s_prep['p95']:.2f}")
+        print(f"inference ms -> mean {s_infer['mean']:.2f} | p50 {s_infer['p50']:.2f} | p95 {s_infer['p95']:.2f}")
+        print(f"total ms     -> mean {s_total['mean']:.2f} | p50 {s_total['p50']:.2f} | p95 {s_total['p95']:.2f}")
+
+    # ---------------- 評価＆要約 ----------------
     if args.eval:
         if not y_true:
             print("[INFO] 評価対象が見つかりませんでした。--input が '親/クラス/画像' 構造か確認してください。")
@@ -337,7 +419,6 @@ def main():
         set_japanese_font(args.font)
         labels = build_label_space(y_true, y_pred, class_names, include_unknown=args.include_unknown)
 
-        # 混同行列
         cm = confusion_matrix(y_true, y_pred, labels=labels)
         report = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
         micro_f1 = f1_score(y_true, y_pred, labels=labels, average="micro", zero_division=0)
@@ -353,9 +434,8 @@ def main():
         plot_confusion_matrix(cm, labels, eval_dir / "confusion_matrix.png", normalize=False)
         plot_confusion_matrix(cm, labels, eval_dir / "confusion_matrix_norm.png", normalize=True)
 
-        # --- ここが新規：クラス別正解率（= 行の正解数 / 行の合計）をコンソールにまとめて表示 ---
-        totals = cm.sum(axis=1)            # 各真値クラスの枚数
-        corrects = np.diag(cm)             # 各クラスの正解数
+        totals = cm.sum(axis=1)
+        corrects = np.diag(cm)
         per_class_acc = np.divide(corrects, np.maximum(totals, 1), out=np.zeros_like(corrects, dtype=float), where=totals>0)
 
         print("\n=== Per-class Accuracy (真値ベース) ===")
@@ -366,17 +446,16 @@ def main():
         print(f"\nOverall accuracy: {acc*100:.2f}%   (samples: {len(y_true)})")
         print(f"Macro-F1: {macro_f1:.4f}  Micro-F1: {micro_f1:.4f}")
 
-        # 誤分類コピー（任意）
         if args.export_miscls:
             out_dir = eval_dir / "misclassified"
             out_dir.mkdir(parents=True, exist_ok=True)
             counter: Dict[Tuple[str,str], int] = {}
             for p, t, pr in zip(paths_for_eval, y_true, y_pred):
-                if t == pr: 
+                if t == pr:
                     continue
                 key = (t, pr)
                 counter[key] = counter.get(key, 0) + 1
-                if counter[key] > args.miscls_limit: 
+                if counter[key] > args.miscls_limit:
                     continue
                 try:
                     im = Image.open(p).convert("RGB")
@@ -397,4 +476,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

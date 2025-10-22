@@ -81,3 +81,11 @@ python train_effnetv2.py \
   --weighted-sampler --weighted-loss \
   --amp
 
+python predict.py \
+  --ckpt runs/effv2_s_384/best.ckpt \
+  --model tf_efficientnetv2_s_in21k_ft_in1k \
+  --input ./cls_dataset/val \
+  --img-size 384 --resize-mode pad \
+  --speed --speed-csv runs/speed_log.csv --warmup 10 \
+  --eval --eval-out runs/eval_from_predict
+
