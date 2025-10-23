@@ -91,12 +91,16 @@ python predict.py \
 
 python train_effnetv2.py \
   --data ./cls_dataset \
-  --out ./runs/effv2_prf \
+  --out ./runs/effv2_wr_t0_5 \
   --model efficientnetv2_s \
   --img-size 384 --batch-size 32 \
-  --epochs 40 \
-  --lr 5e-5 --head-lr-mult 10 --warmup-epochs 3 --min-lr 1e-6 \
+  --epochs 60 \
+  --lr 5e-5 --head-lr-mult 10 \
+  --lr-schedule cosine_wr --t0 5 --t-mult 2 \
+  --min-lr 1e-6 --warmup-epochs 3 \
   --wd 1e-4 --aug light --label-smoothing 0.1 \
   --weighted-sampler --weighted-loss \
   --amp --tensorboard
+
+
 
