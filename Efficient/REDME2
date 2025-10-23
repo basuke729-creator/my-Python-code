@@ -89,3 +89,14 @@ python predict.py \
   --speed --speed-csv runs/speed_log.csv --warmup 10 \
   --eval --eval-out runs/eval_from_predict
 
+python train_effnetv2.py \
+  --data ./cls_dataset \
+  --out ./runs/effv2_prf \
+  --model efficientnetv2_s \
+  --img-size 384 --batch-size 32 \
+  --epochs 40 \
+  --lr 5e-5 --head-lr-mult 10 --warmup-epochs 3 --min-lr 1e-6 \
+  --wd 1e-4 --aug light --label-smoothing 0.1 \
+  --weighted-sampler --weighted-loss \
+  --amp --tensorboard
+
