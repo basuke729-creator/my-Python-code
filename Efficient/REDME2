@@ -102,5 +102,15 @@ python train_effnetv2.py \
   --weighted-sampler --weighted-loss \
   --amp --tensorboard
 
+python predict.py \
+  --ckpt "runs/steplader_epoch50S/best.ckpt" \
+  --model tf_efficientnetv2_s \
+  --img-size 384 \
+  --input "/home/yanamaoo/effnetv2_run/cls_dataset_test/" \
+  --resize-mode pad --bg black \
+  --eval --eval-out "runs/eval_from_predict_steplader_epoch50S" \
+  --save-csv "runs/preds_steplader_epoch50S.csv" \
+  --save-per-class "runs/preds_split"
+
 
 
