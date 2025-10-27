@@ -112,5 +112,24 @@ python predict.py \
   --save-csv "runs/preds_steplader_epoch50S.csv" \
   --save-per-class "runs/preds_split"
 
+python - << 'PY'
+import torch
+
+ckpt_path = "runs/steplader_epoch50S/best.ckpt"      # ← あなたのckptへのパス
+ckpt = torch.load(ckpt_path, map_location="cpu")
+
+# 学習時のクラス並び順をこのリストに正しく入れる
+ckpt["class_names"] = [
+    "脚立1段目の人",
+    "脚立2段目の人",
+    "脚立を跨ぐ人",
+    "脚立上の安全な人",
+    "脚立上の不安定姿勢の人",
+]
+
+torch.save(ckpt, ckpt_path)
+print("✅ class_names を追記して保存し直しました")
+PY
+
 
 
