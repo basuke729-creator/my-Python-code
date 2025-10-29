@@ -1,13 +1,17 @@
 # train_effnetv2.py
 # 統合版:
-# - EfficientNetV2 + 転移学習
+# - EfficientNetV2 + 軺移学習
 # - 段階的フリーズ (--freeze-upto)
 # - FocalLoss / class-weight / label smoothing
 # - WeightedRandomSampler
-# - precision / recall / F1 ログ
-# - CosineAnnealingWarmRestarts / Warmup
+# - precision / recall / F1 ログ (train/val)
+# - Warmup + CosineAnnealingWarmRestarts or plain Cosine
 # - AMP / TensorBoard
-# - 新Augment: RandomResizedCrop + RandomAffine(translate)
+# - Augment:
+#     - RandomResizedCrop + RandomAffine(translateのみ)
+#     - ColorJitter / HorizontalFlip
+#     - RandomErasing (light / strong のときだけ)
+# - 評価時は固定リサイズのみ
 
 import argparse, math, random
 from pathlib import Path
@@ -18,7 +22,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import datasets, transforms
-from sklearn.metrics import precision_score, recall_score, f1_score, classification_report, confusion_matrix
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    classification_report,
+    confusion_matrix,
+)
 import timm
 from tqdm import tqdm
 
@@ -34,33 +44,49 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True  # 高速化OK
+    torch.backends.cudnn.benchmark = True  # OK: 高速化狙い
 
 
-# ---- Augment builder (UPDATED with shift & resize) ----
+# ---- Augment builder (shift & resize + RandomErasing) ----
 def build_transforms(img_size: int, aug: str):
     """
-    aug == "light": 軽い色変換 + ランダムリサイズ + ランダムシフト
-    aug == "strong": もともとの強いAug(ResizedCrop+AutoAugment)
-    aug == "none": リサイズのみ
+    aug == "light":
+        - RandomResizedCrop (scale 0.8~1.0, ratioちょいゆらし)
+        - RandomAffine (translateのみ ±10%)
+        - Flip / ColorJitter
+        - Normalize
+        - RandomErasing(確率25%)
+    aug == "strong":
+        - RandomResizedCrop(0.6~1.0)
+        - AutoAugment(IMAGENET)
+        - Normalize
+        - RandomErasing(確率25%)
+    aug == "none":
+        - Resizeのみ
+        - Normalizeのみ
+        - RandomErasingはしない
     """
     if aug == "light":
         train_tf = transforms.Compose([
-            # ランダムにスケール・クロップして img_size にリサイズ
             transforms.RandomResizedCrop(
                 img_size,
-                scale=(0.8, 1.0),      # 画面の80〜100%を使ってクロップ
-                ratio=(0.9, 1.1)       # ちょい縦長/横長ゆらし
+                scale=(0.8, 1.0),
+                ratio=(0.9, 1.1),
             ),
-            # 回転0°, 平行移動のみ(最大±10%)
             transforms.RandomAffine(
                 degrees=0,
-                translate=(0.1, 0.1)
+                translate=(0.1, 0.1),  # 最大±10% 平行移動
             ),
             transforms.RandomHorizontalFlip(0.5),
             transforms.ColorJitter(0.1, 0.1, 0.1, 0.05),
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            transforms.RandomErasing(
+                p=0.25,
+                scale=(0.02, 0.2),
+                ratio=(0.3, 3.3),
+                value="random",
+            ),
         ])
     elif aug == "strong":
         train_tf = transforms.Compose([
@@ -69,6 +95,12 @@ def build_transforms(img_size: int, aug: str):
             transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET),
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            transforms.RandomErasing(
+                p=0.25,
+                scale=(0.02, 0.2),
+                ratio=(0.3, 3.3),
+                value="random",
+            ),
         ])
     else:  # "none"
         train_tf = transforms.Compose([
@@ -77,7 +109,7 @@ def build_transforms(img_size: int, aug: str):
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
 
-    # val側は絶対に安定した評価（固定リサイズ）
+    # val側は固定（評価の安定性を優先）・RandomErasingしない
     val_tf = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
@@ -102,12 +134,12 @@ def build_dataloaders(
 
     train_ds = datasets.ImageFolder(str(train_dir), transform=train_tf)
     val_ds   = datasets.ImageFolder(str(val_dir),   transform=val_tf)
-    class_names = train_ds.classes  # フォルダ順で決まる
+    class_names = train_ds.classes  # フォルダ名順
 
     sampler = None
     class_weights = torch.ones(len(class_names), dtype=torch.float)
     if use_weighted_sampler:
-        # 各クラスの枚数を数えて逆数で重みづけ
+        # クラス不均衡対策
         counts = np.bincount([y for _, y in train_ds.samples], minlength=len(class_names))
         weights_per_class = 1.0 / np.clip(counts, 1, None)
         weights_per_sample = [weights_per_class[y] for _, y in train_ds.samples]
@@ -142,13 +174,18 @@ def build_dataloaders(
 
 # ---- model builder ----
 def build_model(model_name: str, num_classes: int, pretrained: bool, drop: float):
-    # timm EfficientNetV2系: drop_rate / drop_path_rate
+    """
+    timmのEfficientNetV2系モデルを作成
+    - pretrained=True なら ImageNet等の事前学習重みをロード
+    - num_classes: あなたのクラス数
+    - drop_rate/drop_path_rate に同じ値を入れて軽い正則化
+    """
     model = timm.create_model(
         model_name,
         pretrained=pretrained,
         num_classes=num_classes,
         drop_rate=drop,
-        drop_path_rate=drop
+        drop_path_rate=drop,
     )
     return model
 
@@ -156,33 +193,41 @@ def build_model(model_name: str, num_classes: int, pretrained: bool, drop: float
 # ---- layer freezing helpers ----
 def group_efficientnet_layers(model: nn.Module) -> List[List[str]]:
     """
-    EfficientNetV2系の層を「浅い順」にグルーピングする。
-    freeze-upto=N なら groups[0]..groups[N] まで requires_grad=False にする。
+    EfficientNetV2系の層を「浅い順」にグルーピング。
+    freeze-upto=N なら groups[0]..groups[N] を requires_grad=False にする。
 
-    グループ例(浅い→深い):
-      0: stem.convなど
+    例イメージ:
+      0: stem系 (conv_stem/bn1など)
       1: blocks.0
       2: blocks.1
       3: blocks.2
       4: blocks.3
-      5: blocks.4 以降 + neck 等
+      5: blocks.4以降 + head (残り全部)
     """
     groups: List[List[str]] = []
     names = [n for n, _ in model.named_parameters()]
 
-    stem_group = [n for n in names if n.startswith("conv_stem") or n.startswith("bn1") or n.startswith("stem")]
+    # stemらしき層
+    stem_group = [
+        n for n in names
+        if n.startswith("conv_stem")
+        or n.startswith("bn1")
+        or n.startswith("stem")
+    ]
     if stem_group:
         groups.append(stem_group)
 
-    # blocks.x
-    block_ids = sorted({n.split(".")[1] for n in names if n.startswith("blocks.") and n.split(".")[1].isdigit()},
-                       key=lambda x: int(x))
+    # blocks.{i}.*
+    block_ids = sorted(
+        {n.split(".")[1] for n in names if n.startswith("blocks.") and n.split(".")[1].isdigit()},
+        key=lambda x: int(x)
+    )
     for bid in block_ids:
         g = [n for n in names if n.startswith(f"blocks.{bid}.")]
         if g:
             groups.append(g)
 
-    # 残り(例えば head / classifier / conv_head / bn2 etc.)
+    # 残り (head / classifier / conv_head / bn2 など)
     used = set()
     for g in groups:
         used.update(g)
@@ -196,11 +241,11 @@ def group_efficientnet_layers(model: nn.Module) -> List[List[str]]:
 def freeze_upto(model: nn.Module, upto: int):
     """
     upto=0 → groups[0]までフリーズ
-    upto=1 → groups[0],groups[1]までフリーズ
+    upto=1 → groups[0], groups[1]までフリーズ
     ...
     """
     groups = group_efficientnet_layers(model)
-    max_idx = min(upto, len(groups)-1)
+    max_idx = min(upto, len(groups) - 1)
     to_freeze = set()
     for gi in range(max_idx + 1):
         for n in groups[gi]:
@@ -213,6 +258,11 @@ def freeze_upto(model: nn.Module, upto: int):
 
 # ---- param groups for different LR on head/backbone ----
 def make_param_groups(model: nn.Module, base_lr: float, head_lr_mult: float, weight_decay: float):
+    """
+    ヘッド(classifier, fcなど)には base_lr * head_lr_mult、
+    バックボーンには base_lr、
+    みたいにLRを分ける。
+    """
     head_names = ("classifier", "fc")
     back_params, head_params = [], []
     for n, p in model.named_parameters():
@@ -235,8 +285,8 @@ def make_param_groups(model: nn.Module, base_lr: float, head_lr_mult: float, wei
 class WarmupThenCosineRestart(torch.optim.lr_scheduler._LRScheduler):
     """
     ざっくり挙動:
-      - warmup_epochs までは linearly up
-      - その後 CosineAnnealingWarmRestarts を使ってゆっくり上下
+      - warmup_epochs までは線形アップ
+      - その後 CosineAnnealingWarmRestarts でゆっくり上下を繰り返す
     """
     def __init__(self, optimizer, warmup_epochs, T_0, T_mult, eta_min, steps_per_epoch, last_epoch=-1):
         self.warmup_epochs = max(0, warmup_epochs)
@@ -250,20 +300,16 @@ class WarmupThenCosineRestart(torch.optim.lr_scheduler._LRScheduler):
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
-        # エポック単位ではなくiter単位で呼ばれる想定で使うわけではないが、
-        # train()内では .step() をエポック末だけ呼ぶので、ここでは
-        # warmupかどうかだけで分岐させる簡易版
+        # epoch単位で step() される想定
         epoch = self.last_epoch
-        base_lrs = [g.get('initial_lr', g['lr']) for g in self.optimizer.param_groups]
+        base_lrs = [pg.get('initial_lr', pg['lr']) for pg in self.optimizer.param_groups]
 
         if epoch < self.warmup_epochs:
-            # 線形アップ: start_factor=0.1 → 1.0 的な感じにする
+            # 線形アップ: 0.1→1.0 みたいにならす
             warm_factor = 0.1 + 0.9 * (epoch + 1) / max(1, self.warmup_epochs)
             return [lr * warm_factor for lr in base_lrs]
         else:
-            # warmup後はCosineAnnealingWarmRestartsのlrを参照
-            # 一旦 after_warmup 内部を進めてから lr を読む
-            # (epoch - warmup_epochs) を last_epoch として疑似的に進める
+            # warmup後はCosineAnnealingWarmRestartsにお任せ
             self.after_warmup.last_epoch = epoch - self.warmup_epochs
             self.after_warmup.step(epoch=epoch - self.warmup_epochs)
             return [pg['lr'] for pg in self.after_warmup.optimizer.param_groups]
@@ -272,7 +318,7 @@ class WarmupThenCosineRestart(torch.optim.lr_scheduler._LRScheduler):
         if epoch is None:
             epoch = self.last_epoch + 1
         self.last_epoch = epoch
-        # get_lr()内でafter_warmupも更新済
+        # get_lr()内で after_warmup も更新済
 
 
 def build_scheduler(optimizer, args, steps_per_epoch):
@@ -286,15 +332,15 @@ def build_scheduler(optimizer, args, steps_per_epoch):
             steps_per_epoch=steps_per_epoch,
         )
     else:
-        # fallback: simple cosine (no restarts / handled by CosineAnnealingLR)
+        # fallback: simple cosine
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=max(1, args.epochs),
-            eta_min=args.min_lr
+            eta_min=args.min_lr,
         )
 
 
-# ---- focal loss ----
+# ---- FocalLoss ----
 class FocalLoss(nn.Module):
     def __init__(self, gamma: float = 2.0, weight=None, reduction='mean'):
         super().__init__()
@@ -372,44 +418,44 @@ def train(args):
         args.batch_size,
         args.workers,
         args.aug,
-        args.weighted_sampler
+        args.weighted_sampler,
     )
     num_classes = len(class_names)
 
-    # モデル
+    # モデル作成
     model = build_model(
         args.model,
         num_classes,
         pretrained=not args.no_pretrained,
-        drop=args.drop
+        drop=args.drop,
     ).to(device)
 
-    # 初期重みを別のckptから読み込みたい場合
+    # 既存ckptで初期化したいとき
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu")
         state = ckpt.get("model", ckpt)
         missing, unexpected = model.load_state_dict(state, strict=False)
         print(f"[Init] loaded from {args.init_from} missing={len(missing)} unexpected={len(unexpected)}")
 
-    # freeze指定（段階的に浅い層から止める）
+    # freeze指定
     if args.freeze_upto is not None:
         freeze_upto(model, args.freeze_upto)
         print(f"[Freeze] freeze_upto={args.freeze_upto}")
 
     # Optimizer
     if args.freeze_upto is not None:
-        # 一部フリーズ済 → そのまま残りパラメータに単一LR
+        # いくらかフリーズしてる場合は残りパラメータだけ単一LRで更新
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd, betas=(0.9, 0.999))
     else:
-        # ヘッドに高めのLRをかける
+        # フルファインチューニング時はheadに大きいLR
         param_groups = make_param_groups(model, args.lr, args.head_lr_mult, args.wd)
         optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999), eps=1e-8)
 
     steps_per_epoch = max(1, math.ceil(len(train_loader.dataset) / args.batch_size))
     scheduler = build_scheduler(optimizer, args, steps_per_epoch)
 
-    # 損失関数: focal / CE(+label_smoothing)
+    # 損失関数選択
     weights = class_weights.to(device) if args.weighted_loss else None
     if args.focal_loss:
         criterion = FocalLoss(gamma=args.focal_gamma, weight=weights, reduction='mean')
@@ -457,14 +503,13 @@ def train(args):
 
             run_loss += loss.item() * x.size(0) * args.accum_steps
 
-            # train側メトリクス用に記録
+            # trainメトリクス用
             all_logits.append(logits.detach().cpu())
             all_targets.append(y.detach().cpu())
 
             global_step += 1
 
-        # === epoch終了後 ===
-        # trainメトリクス計算
+        # ==== epoch終了後: train側メトリクス ====
         all_logits = torch.cat(all_logits, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         train_preds = all_logits.argmax(dim=1)
@@ -475,10 +520,10 @@ def train(args):
         train_f1   = f1_score(all_targets, train_preds, average="macro", zero_division=0)
         train_loss = run_loss / max(1, len(all_targets))
 
-        # valメトリクス
+        # ==== valメトリクス ====
         val_stats = evaluate(model, val_loader, device)
 
-        # LRログ（複数パラメタグループのLRも残す）
+        # ==== ログ・表示 ====
         lrs_now = [pg["lr"] for pg in optimizer.param_groups]
         lrs_str = ", ".join([f"{lr:.2e}" for lr in lrs_now])
 
@@ -490,7 +535,6 @@ def train(args):
             f"lr=[{lrs_str}]"
         )
 
-        # TensorBoard書き込み
         if tb:
             tb.add_scalar("train/acc",   train_acc,  epoch)
             tb.add_scalar("train/f1",    train_f1,   epoch)
@@ -502,14 +546,14 @@ def train(args):
             tb.add_scalar("val/prec",    val_stats["prec"], epoch)
             tb.add_scalar("val/rec",     val_stats["rec"],  epoch)
 
-            # グループごとのLR
+            # 複数LRグループの可視化
             for gi, lr in enumerate(lrs_now):
                 tb.add_scalar(f"train/lr_group{gi}", lr, epoch)
 
-        # schedulerを1epoch進める
+        # ==== スケジューラ1epoch分進める ====
         scheduler.step(epoch)
 
-        # ベストモデル保存 (macro-F1ベース)
+        # ==== ベストモデル保存 (macro-F1ベース) ====
         if val_stats["f1"] > best_f1:
             best_f1 = val_stats["f1"]
             torch.save({
@@ -528,7 +572,7 @@ def train(args):
             "class_names": class_names,
         }, last_path)
 
-    # 学習終了後、最終レポート: val全体で classification_report / confusion_matrix
+    # ---- 学習終了後 追加レポート (valセットでの詳細) ----
     ckpt = torch.load(best_path, map_location="cpu")
     model.load_state_dict(ckpt["model"])
     model.to(device).eval()
@@ -553,55 +597,77 @@ def parse_args():
     ap = argparse.ArgumentParser("EfficientNet-V2 Transfer Learning (Full Features)")
 
     # data / io
-    ap.add_argument("--data", required=True, help="cls_dataset のルート（train/ と val/ がある）")
-    ap.add_argument("--out", default="./runs/effnetv2_run", help="出力ディレクトリ")
-    ap.add_argument("--model", default="tf_efficientnetv2_s", help="timmモデル名 (例: tf_efficientnetv2_s)")
+    ap.add_argument("--data", required=True,
+                    help="cls_dataset のルート（train/ と val/ があるフォルダ）")
+    ap.add_argument("--out", default="./runs/effnetv2_run",
+                    help="出力ディレクトリ (ckpt や tb ログが入る)")
+    ap.add_argument("--model", default="tf_efficientnetv2_s",
+                    help="timmモデル名 (例: tf_efficientnetv2_s, tf_efficientnetv2_m ...)")
     ap.add_argument("--img-size", type=int, default=384)
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=50)
 
     # LR / scheduler
-    ap.add_argument("--lr", type=float, default=1e-4, help="ベースLR(バックボーン用)")
-    ap.add_argument("--head-lr-mult", type=float, default=10.0, help="分類ヘッドLR倍率")
-    ap.add_argument("--wd", type=float, default=1e-4, help="Weight Decay")
-    ap.add_argument("--min-lr", type=float, default=1e-6, help="cosineでの下限LR")
-    ap.add_argument("--warmup-epochs", type=int, default=3, help="ウォームアップエポック数")
+    ap.add_argument("--lr", type=float, default=1e-4,
+                    help="バックボーン側の基準LR")
+    ap.add_argument("--head-lr-mult", type=float, default=10.0,
+                    help="分類ヘッド側LR倍率 (freezeなしのとき有効)")
+    ap.add_argument("--wd", type=float, default=1e-4,
+                    help="Weight Decay (AdamW)")
+    ap.add_argument("--min-lr", type=float, default=1e-6,
+                    help="Cosineスケジュール到達下限LR")
+    ap.add_argument("--warmup-epochs", type=int, default=3,
+                    help="ウォームアップ(ゆっくりLR上げる)エポック数")
     ap.add_argument("--lr-schedule", choices=["cosine", "cosine_wr"], default="cosine_wr",
-                    help="cosine:通常CosineAnnealingLR / cosine_wr:Warmup+CosineAnnealingWarmRestarts")
-    ap.add_argument("--T0", type=int, default=5, help="CosineAnnealingWarmRestarts 初期間隔")
-    ap.add_argument("--T-mult", type=int, default=2, help="CosineAnnealingWarmRestarts のT_mult (>=1)")
-    # Note: WarmupThenCosineRestartですでにT_mult等使ってるが、そこではargs.T_multとして参照
+                    help="cosine: CosineAnnealingLR (1回なだらかに下げる)\n"
+                         "cosine_wr: Warmup + CosineAnnealingWarmRestarts(山を繰り返す)")
+    ap.add_argument("--T0", type=int, default=5,
+                    help="CosineAnnealingWarmRestarts の最初の周期長 (エポック数)")
+    ap.add_argument("--T-mult", type=int, default=2,
+                    help="CosineAnnealingWarmRestarts の周期を伸ばす倍率 (>=1)")
 
     # regularization
-    ap.add_argument("--drop", type=float, default=0.0, help="Dropout/DropPath 値")
-    ap.add_argument("--label-smoothing", type=float, default=0.0, help="CEのラベルスムージング")
+    ap.add_argument("--drop", type=float, default=0.0,
+                    help="Dropout/DropPath の強さ")
+    ap.add_argument("--label-smoothing", type=float, default=0.0,
+                    help="CE用のラベルスムージング係数")
 
     # imbalance options
-    ap.add_argument("--weighted-sampler", action="store_true", help="クラス不均衡対策: サンプラー")
-    ap.add_argument("--weighted-loss", action="store_true", help="クラス不均衡対策: class_weightをLossに適用")
+    ap.add_argument("--weighted-sampler", action="store_true",
+                    help="クラス不均衡対策: サンプラー (少数クラスをたくさん引く)")
+    ap.add_argument("--weighted-loss", action="store_true",
+                    help="クラス不均衡対策: class_weightをLossに適用")
 
     # focal loss
     ap.add_argument("--focal-loss", action="store_true", dest="focal_loss",
-                    help="FocalLossを使う（少数クラス重視）")
-    ap.add_argument("--focal-gamma", type=float, default=2.0, help="FocalLoss の gamma")
+                    help="FocalLossを使用 (少数クラスをより重視)")
+    ap.add_argument("--focal-gamma", type=float, default=2.0,
+                    help="FocalLossのγ (大きいほど難しい例を重視)")
 
     # aug
     ap.add_argument("--aug", choices=["none", "light", "strong"], default="light",
-                    help="データ拡張プリセット")
+                    help="データ拡張プリセット (light 推奨スタート)")
 
     # grad / system
-    ap.add_argument("--accum-steps", type=int, default=1, help="勾配累積 (大きい実質バッチ)")
+    ap.add_argument("--accum-steps", type=int, default=1,
+                    help="勾配累積で実質バッチサイズを大きくする")
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--amp", action="store_true", help="自動混合精度AMP")
-    ap.add_argument("--tensorboard", action="store_true", help="TensorBoardログを保存")
-    ap.add_argument("--cpu", action="store_true", help="強制CPU")
+    ap.add_argument("--amp", action="store_true",
+                    help="自動混合精度AMPで高速/省メモリ化")
+    ap.add_argument("--tensorboard", action="store_true",
+                    help="TensorBoardログを out/tb/ に書き出す")
+    ap.add_argument("--cpu", action="store_true",
+                    help="CPUで強制実行 (通常は不要)")
     ap.add_argument("--seed", type=int, default=42)
 
     # transfer / freeze
-    ap.add_argument("--no-pretrained", action="store_true", help="ImageNetなどの事前学習重みを使わない")
-    ap.add_argument("--init-from", default="", help="既存ckptから読み込みたい場合(best.ckptなど)")
+    ap.add_argument("--no-pretrained", action="store_true",
+                    help="ImageNet等の事前学習重みを使わない (ランダム初期化)")
+    ap.add_argument("--init-from", default="",
+                    help="既存ckptから重みロードしたいとき(best.ckptなど)")
     ap.add_argument("--freeze-upto", type=int, default=None,
-                    help="0,1,2,... と指定すると浅い層からそのグループまで凍結 (特徴抽出器固定の度合いを制御)")
+                    help="0,1,2,... とすると浅い層から順にそのグループまで凍結。\n"
+                         "例: 0=stemだけ止める, 1=stem+blocks.0 など。")
 
     return ap.parse_args()
 
@@ -610,11 +676,11 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    # torch schedの都合上、T_mult >= 1の制約は守らせておく
+    # PyTorchのCosineAnnealingWarmRestartsはT_mult>=1必須なのでガード
     if args.T_mult < 1:
         raise ValueError("--T-mult は1以上にしてください")
 
-    # ここで args を渡して学習
     train(args)
+
 
 
