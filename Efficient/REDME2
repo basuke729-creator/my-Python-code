@@ -131,5 +131,24 @@ torch.save(ckpt, ckpt_path)
 print("✅ class_names を追記して保存し直しました")
 PY
 
+python train_effnetv2.py \
+  --data "./cls_dataset" \
+  --out "./runs/exp_shiftresize_focal_freeze4" \
+  --model tf_efficientnetv2_s \
+  --img-size 384 \
+  --batch-size 32 \
+  --epochs 50 \
+  --lr 1e-4 \
+  --min-lr 1e-6 \
+  --wd 1e-4 \
+  --warmup-epochs 3 \
+  --lr-schedule cosine_wr --T0 5 --T-mult 2 \
+  --aug light \
+  --amp \
+  --tensorboard \
+  --freeze-upto 4 \
+  --focal-loss --focal-gamma 2.0 \
+  --weighted-loss
+
 
 
