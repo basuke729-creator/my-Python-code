@@ -2,5 +2,7 @@ python preview_random_erasing.py \
   --input "./sample_images" \
   --output "./preview_erased" \
   --img-size 384 \
-  --p 0.25 \
+  --p 1.0 \
+  --scale-min 0.02 \
+  --scale-max 0.4 \
   --repeats 3
