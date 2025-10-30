@@ -1,0 +1,6 @@
+python preview_random_erasing.py \
+  --input "./sample_images" \
+  --output "./preview_erased" \
+  --img-size 384 \
+  --p 0.25 \
+  --repeats 3
