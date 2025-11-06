@@ -1,0 +1,12 @@
+# 1) 必要物のインストール
+python -m pip install "anomalib>=1.0.0" scikit-learn pandas
+
+# 2) データ配置（安全のみで学習）
+# dataset/
+# ├─ train/normal/        ← 学習は“安全”のみ
+# ├─ test/normal/         ← 評価：安全
+# └─ test/abnormal/       ← 評価：危険
+
+# 3) 実行
+python train_patchcore.py --data ./dataset --out ./runs/patchcore_ladder
+python infer_patchcore_confmat.py --data ./dataset --exp ./runs/patchcore_ladder
