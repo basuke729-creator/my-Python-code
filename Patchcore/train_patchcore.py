@@ -1,5 +1,5 @@
-# train_patchcore_v2.py
-import argparse, os, subprocess, textwrap
+# train_patchcore_v2.py  (for anomalib 2.2.0)
+import argparse, os, subprocess
 
 YAML_TMPL = """\
 model:
@@ -8,10 +8,7 @@ model:
     backbone: resnet50
     layers: [layer2, layer3]
     coreset_sampling_ratio: 0.01
-    nn_method:
-      method: {nn_method}
-      n_neighbors: 9
-
+{nn_block}
 data:
   class_path: anomalib.data.folder.Folder
   init_args:
@@ -34,15 +31,19 @@ project:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="dataset root")
-    ap.add_argument("--out",  required=True, help="experiment dir")
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--out", required=True)
     ap.add_argument("--imgsz", type=int, default=384)
-    ap.add_argument("--nn", default="sklearn", choices=["sklearn","faiss"])
+    ap.add_argument("--faiss", action="store_true")  # --faiss を付けたら faiss を使う
     args = ap.parse_args()
 
     data_root = os.path.abspath(args.data)
     exp_dir   = os.path.abspath(args.out)
     os.makedirs(exp_dir, exist_ok=True)
+
+    nn_block = ""
+    if args.faiss:
+        nn_block = "    nn_method:\n      name: faiss\n      n_neighbors: 9\n"
 
     cfg_path = os.path.join(exp_dir, "patchcore_cls.yaml")
     with open(cfg_path, "w", encoding="utf-8") as f:
@@ -50,12 +51,12 @@ def main():
             data_root=data_root,
             exp_dir=exp_dir,
             imgsz=args.imgsz,
-            nn_method=args.nn
+            nn_block=nn_block
         ))
     print("[INFO] config ->", cfg_path)
 
     subprocess.run(["anomalib", "train", "--config", cfg_path], check=True)
-    print("[OK] Training finished at", exp_dir)
+    print("[OK] Training finished")
 
 if __name__ == "__main__":
     main()
