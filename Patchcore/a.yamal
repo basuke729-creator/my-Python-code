@@ -1,0 +1,24 @@
+model:
+  class_path: anomalib.models.Patchcore
+  init_args:
+    backbone: resnet50
+    layers: [layer2, layer3]
+    coreset_sampling_ratio: 0.01
+
+data:
+  class_path: anomalib.data.Folder
+  init_args:
+    root: /home/yamamao/Patchcore/dataset
+    normal_dir: normal
+    abnormal_dir: abnormal
+    image_size: 384
+    train_batch_size: 32
+    eval_batch_size: 32
+    test_split_mode: from_dir
+
+trainer:
+  accelerator: auto
+  max_epochs: 1
+
+project:
+  path: ./runs/patchcore_cls
