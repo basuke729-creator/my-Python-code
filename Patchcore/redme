@@ -10,3 +10,5 @@ python -m pip install "anomalib>=1.0.0" scikit-learn pandas
 # 3) 実行
 python train_patchcore.py --data ./dataset --out ./runs/patchcore_ladder
 python infer_patchcore_confmat.py --data ./dataset --exp ./runs/patchcore_ladder
+
+anomalib train --config /home/yamamao/Patchcore/patchcore_cls.yaml
