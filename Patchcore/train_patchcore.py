@@ -3,31 +3,33 @@ import argparse, os, subprocess, textwrap, datetime, pathlib
 
 YAML_TMPL = """\
 model:
-  name: patchcore
-  backbone: resnet50
-  layers: ["layer2","layer3"]
-  coreset_sampling_ratio: 0.01
-  nn_method:
-    name: faiss           # CPUのみなら 'sklearn'
-    n_neighbors: 9
+  class_path: anomalib.models.image.patchcore.PatchCore
+  init_args:
+    backbone: resnet50
+    layers: [layer2, layer3]
+    coreset_sampling_ratio: 0.01
+    nn_method:
+      method: faiss      # faiss を使わないなら "sklearn"
+      n_neighbors: 9
 
-dataset:
-  name: folder
-  format: folder
-  path: {data_root}
-  image_size: 256
-  normal_dir: normal
-  abnormal_dir: abnormal
-  task: classification    # 画像レベル(ヒートマップ不要)
-  test_split_mode: from_dir
-  # val を置かない場合は test が使われます
+data:
+  class_path: anomalib.data.folder.Folder
+  init_args:
+    root: /path/to/dataset        # ← ここをあなたの実パスに
+    normal_dir: normal
+    abnormal_dir: abnormal
+    task: classification          # 画像レベル（ヒートマップ不要）
+    image_size: 256
+    test_split_mode: from_dir
+    train_batch_size: 32
+    eval_batch_size: 32
 
 trainer:
   accelerator: auto
-  max_epochs: 1           # PatchCoreは"特徴作成"なので1epochでOK
+  max_epochs: 1
 
 project:
-  path: {exp_dir}
+  path: ./runs/patchcore_cls
 """
 
 def main():
