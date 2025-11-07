@@ -1,64 +1,62 @@
-# train_patchcore.py
-import argparse, os, subprocess, textwrap, datetime, pathlib
+# train_patchcore_v2.py
+import argparse, os, subprocess, textwrap
 
 YAML_TMPL = """\
 model:
-  class_path: anomalib.models.image.patchcore.PatchCore
+  class_path: anomalib.models.image.patchcore.Patchcore
   init_args:
     backbone: resnet50
     layers: [layer2, layer3]
     coreset_sampling_ratio: 0.01
     nn_method:
-      method: faiss      # faiss を使わないなら "sklearn"
+      method: {nn_method}
       n_neighbors: 9
 
 data:
   class_path: anomalib.data.folder.Folder
   init_args:
-    root: /path/to/dataset        # ← ここをあなたの実パスに
+    root: {data_root}
     normal_dir: normal
     abnormal_dir: abnormal
-    task: classification          # 画像レベル（ヒートマップ不要）
-    image_size: 256
-    test_split_mode: from_dir
+    task: classification
+    image_size: {imgsz}
     train_batch_size: 32
     eval_batch_size: 32
+    test_split_mode: from_dir
 
 trainer:
   accelerator: auto
   max_epochs: 1
 
 project:
-  path: ./runs/patchcore_cls
+  path: {exp_dir}
 """
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="dataset root (train/test 下に normal/abnormal)")
-    ap.add_argument("--out",  required=True, help="experiment root output dir")
+    ap.add_argument("--data", required=True, help="dataset root")
+    ap.add_argument("--out",  required=True, help="experiment dir")
+    ap.add_argument("--imgsz", type=int, default=384)
+    ap.add_argument("--nn", default="sklearn", choices=["sklearn","faiss"])
     args = ap.parse_args()
 
     data_root = os.path.abspath(args.data)
-    exp_root  = os.path.abspath(args.out)
-    os.makedirs(exp_root, exist_ok=True)
+    exp_dir   = os.path.abspath(args.out)
+    os.makedirs(exp_dir, exist_ok=True)
 
-    # YAMLを書き出し
-    cfg_dir = os.path.join(exp_root, "configs")
-    os.makedirs(cfg_dir, exist_ok=True)
-    cfg_path = os.path.join(cfg_dir, "patchcore_cls.yaml")
+    cfg_path = os.path.join(exp_dir, "patchcore_cls.yaml")
     with open(cfg_path, "w", encoding="utf-8") as f:
-        f.write(YAML_TMPL.format(data_root=data_root, exp_dir=exp_root))
+        f.write(YAML_TMPL.format(
+            data_root=data_root,
+            exp_dir=exp_dir,
+            imgsz=args.imgsz,
+            nn_method=args.nn
+        ))
+    print("[INFO] config ->", cfg_path)
 
-    print(f"[INFO] config -> {cfg_path}")
-
-    # anomalib train を実行
-    # 参考: anomalib CLI ドキュメント（train/test/infer を一貫提供）:contentReference[oaicite:2]{index=2}
-    cmd = ["anomalib", "train", "--config", cfg_path]
-    print("[CMD]", " ".join(cmd))
-    subprocess.run(cmd, check=True)
-
-    print("\n[OK] Training finished.")
-    print(f"[hint] 次は推論・評価: python infer_patchcore_confmat.py --data {data_root} --exp {exp_root}")
+    subprocess.run(["anomalib", "train", "--config", cfg_path], check=True)
+    print("[OK] Training finished at", exp_dir)
 
 if __name__ == "__main__":
     main()
+
