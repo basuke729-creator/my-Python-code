@@ -9,20 +9,23 @@ data:
   class_path: anomalib.data.Folder
   init_args:
     name: ladder_dataset
-    # ← 学習用は train/normal を使う
-    root: /home/yamamao/Patchcore/dataset/train
-    normal_dir: normal
+    root: /home/yamamao/Patchcore/dataset
 
-    # ← 評価用は test/normal と test/abnormal を使う
-    test_path: /home/yamamao/Patchcore/dataset/test
-    normal_test_dir: normal
-    abnormal_test_dir: abnormal
+    # 各 split 用フォルダを明示
+    train_path: train
+    val_path: val
+    test_path: test
+
+    # 各カテゴリ名
+    normal_dir: normal
+    abnormal_dir: abnormal
 
     train_batch_size: 32
     eval_batch_size: 32
-    val_split_mode: from_test   # 検証は test から自動分割
-    val_split_ratio: 0.2
-    seed: 42
+    
+    # val/test の split モードは from_dir
+    test_split_mode: from_dir
+    val_split_mode: from_dir
 
 trainer:
   accelerator: auto
