@@ -10,23 +10,14 @@ data:
   init_args:
     name: ladder_dataset
     root: /home/yamamao/Patchcore/dataset
-
-    # 各 split 用フォルダを明示
-    train_path: train
-    val_path: val
-    test_path: test
-
-    # 各カテゴリ名
     normal_dir: normal
     abnormal_dir: abnormal
-
     train_batch_size: 32
     eval_batch_size: 32
-    
-    # val/test の split モードは from_dir
-    test_split_mode: from_dir
     val_split_mode: from_dir
+    test_split_mode: from_dir
 
 trainer:
   accelerator: auto
   max_epochs: 1
+

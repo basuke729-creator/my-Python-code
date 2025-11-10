@@ -12,3 +12,7 @@ python train_patchcore.py --data ./dataset --out ./runs/patchcore_ladder
 python infer_patchcore_confmat.py --data ./dataset --exp ./runs/patchcore_ladder
 
 anomalib train --config /home/yamamao/Patchcore/patchcore_cls.yaml
+
+
+anomalib --print_config --config /home/yamamao/Patchcore/patchcore_cls.yaml | grep -A2 -n "data:"
+anomalib --print_config --config /home/yamamao/Patchcore/patchcore_cls.yaml | grep -n "val_split_mode\|test_split_mode\|root\|normal_dir\|abnormal_dir"
