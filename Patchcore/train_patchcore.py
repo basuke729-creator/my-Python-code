@@ -1,65 +1,84 @@
-# runpatchcore.py  （Embedding store is empty 対策・完全版）
-from __future__ import annotations
-import os
-import glob
-import torch
-from lightning.pytorch import Trainer
-from anomalib.models import Patchcore
-from anomalib.data import Folder
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# ====== パス設定 ======
-DATA_ROOT = "/home/yamamoao/Patchcore/dataset"  # ← ここだけ直せばOK
-OUT_ROOT  = "/home/yamamoao/Patchcore/py_results"
+"""
+anomalib v2.x / PatchCore を最小で確実に通すワンファイル版
+- 学習 (fit) → テスト (test) を実行
+- フォルダ構成は "train/normal", "val/{normal,abnormal}", "test/{normal,abnormal}"
+- datamodule は anomalib.data.Folder を、model は PatchcoreLightning を使用
+"""
+
+from pathlib import Path
+from typing import Tuple
+
+from lightning.pytorch import Trainer, seed_everything
+from anomalib.data import Folder
+from anomalib.models.image.patchcore import PatchcoreLightning
+
+
+# ===== ユーザ環境に合わせて必要ならここだけ変更 =====
+DATA_ROOT = Path("/home/yamamoao/Patchcore/dataset")   # ← 3階層のルート
+OUT_ROOT  = Path("/home/yamamoao/Patchcore/results")   # ← 出力ルート
+
 BATCH = 32
 NUM_WORKERS = 8
 MAX_EPOCHS = 1
-# =====================
+SEED = 42
+# ====================================================
 
-def must_dir(p: str):
-    if not os.path.isdir(p):
-        raise FileNotFoundError(f"Directory not found: {p}")
 
-def count_images(d: str) -> int:
-    exts = ("*.jpg","*.jpeg","*.png","*.bmp","*.tif","*.tiff","*.webp")
-    return sum(len(glob.glob(os.path.join(d, e))) for e in exts)
+def assert_dataset_layout(root: Path) -> Tuple[int, int, int, int, int, int]:
+    """想定レイアウトをチェックし、枚数を返す"""
+    def count(p: Path) -> int:
+        return sum(1 for _ in p.rglob("*") if _.is_file())
 
-def sanity_check():
-    # 期待構成:
-    # dataset/
-    #   train/ normal/
-    #   val/   normal/ abnormal/
-    #   test/  normal/ abnormal/
-    must_dir(DATA_ROOT)
-    for split in ("train", "val", "test"):
-        must_dir(os.path.join(DATA_ROOT, split))
-        must_dir(os.path.join(DATA_ROOT, split, "normal"))
-    # val/test は abnormal も（評価用に）必須
-    for split in ("val", "test"):
-        must_dir(os.path.join(DATA_ROOT, split, "abnormal"))
+    expected = [
+        root / "train" / "normal",
+        root / "val" / "normal",
+        root / "val" / "abnormal",
+        root / "test" / "normal",
+        root / "test" / "abnormal",
+    ]
+    for p in expected:
+        if not p.exists():
+            raise FileNotFoundError(
+                f"[DATA CHECK] 必須フォルダが見つかりません: {p}\n"
+                "フォルダ構成は必ず次の形にしてください：\n"
+                "dataset/\n"
+                "  train/ normal/\n"
+                "  val/   normal/ abnormal/\n"
+                "  test/  normal/ abnormal/\n"
+            )
 
-    n_train = count_images(os.path.join(DATA_ROOT, "train", "normal"))
-    n_val_n = count_images(os.path.join(DATA_ROOT, "val", "normal"))
-    n_val_a = count_images(os.path.join(DATA_ROOT, "val", "abnormal"))
-    n_test_n = count_images(os.path.join(DATA_ROOT, "test", "normal"))
-    n_test_a = count_images(os.path.join(DATA_ROOT, "test", "abnormal"))
+    n_tr = count(root / "train" / "normal")
+    n_vn = count(root / "val" / "normal")
+    n_va = count(root / "val" / "abnormal")
+    n_tn = count(root / "test" / "normal")
+    n_ta = count(root / "test" / "abnormal")
 
-    if n_train == 0:
-        raise RuntimeError("train/normal の画像が 0 枚です。これだと埋め込みが貯まらずに落ちます。")
-    print(f"[SANITY] train/normal={n_train}, val(normal,abnormal)=({n_val_n},{n_val_a}), "
-          f"test(normal,abnormal)=({n_test_n},{n_test_a})")
+    print(f"[SANITY] train/normal={n_tr}, val=(normal,abnormal)=({n_vn},{n_va}), "
+          f"test(normal,abnormal)=({n_tn},{n_ta})")
+
+    return n_tr, n_vn, n_va, n_tn, n_ta, 0
+
 
 def build_datamodule() -> Folder:
-    # ← ここを差し替え
+    """
+    v2.x の Folder は split ごとに normal/abnormal を指定する **1行方式** を使う。
+    ※ normal_val_dir 等の“split個別ディレクトリ名”は v2.x の Folder.__init__ では受け付けません。
+    """
     dm = Folder(
         name="ladder_dataset",
-        root=DATA_ROOT,
-        # --- 重要ポイント：split ごとのサブフォルダを明示する ---
-        normal_dir="train/normal",             # 学習で使うのは normal のみ
-        normal_val_dir="val/normal",
-        abnormal_val_dir="val/abnormal",
-        normal_test_dir="test/normal",
-        abnormal_test_dir="test/abnormal",
-        # ---------------------------------------------------------
+        root=str(DATA_ROOT),       # Path でも OK だが str で渡して互換確保
+        train_dir="train",
+        val_dir="val",
+        test_dir="test",
+        normal_dir="normal",
+        abnormal_dir="abnormal",
+        # val/test はフォルダ階層からそのまま読む
+        val_split_mode="from_dir",
+        test_split_mode="from_dir",
+
         train_batch_size=BATCH,
         eval_batch_size=BATCH,
         num_workers=NUM_WORKERS,
@@ -67,37 +86,56 @@ def build_datamodule() -> Folder:
     return dm
 
 
-def build_model() -> Patchcore:
-    # coreset の比率は 0.01 のままでOK。空ストアの場合でも今回は train=0 を防いでいるので通る。
-    return Patchcore(
+def build_model() -> PatchcoreLightning:
+    """
+    LightningModule を返すことが重要。
+    PatchcoreLightning(backbone=..., layers=..., coreset_sampling_ratio=...) を使用。
+    """
+    model = PatchcoreLightning(
         backbone="resnet50",
         layers=["layer2", "layer3"],
         coreset_sampling_ratio=0.01,
     )
+    return model
 
-def build_trainer() -> Trainer:
-    return Trainer(
-        max_epochs=MAX_EPOCHS,
-        default_root_dir=OUT_ROOT,
-        accelerator="auto",
-        log_every_n_steps=1,
-        enable_checkpointing=True,
-    )
 
 def main():
-    torch.manual_seed(42)
-    sanity_check()
+    seed_everything(SEED)
 
+    # データ構成の事前チェック
+    assert_dataset_layout(DATA_ROOT)
+
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # Datamodule / Model
     dm = build_datamodule()
     model = build_model()
-    trainer = build_trainer()
 
-    # fit では train(normal) を使って埋め込みを貯め、終了時に coreset 作成
+    # Trainer
+    trainer = Trainer(
+        accelerator="auto",
+        max_epochs=MAX_EPOCHS,
+        default_root_dir=str(OUT_ROOT),
+        log_every_n_steps=1,
+        enable_progress_bar=True,
+        deterministic=False,
+    )
+
+    # === 学習 ===
+    print("\n[INFO] ======= FIT (train) =======")
     trainer.fit(model=model, datamodule=dm)
 
-    # 検証・テスト（best チェックポイントでOK）
-    trainer.validate(model=model, datamodule=dm, ckpt_path="best")
-    trainer.test(model=model, datamodule=dm, ckpt_path="best")
+    # === テスト（AUROC, F1 が表示される）===
+    print("\n[INFO] ======= TEST =======")
+    # ckpt は自動保存先から最新を自動解決（無ければ現在の重みで評価）
+    try:
+        trainer.test(model=model, datamodule=dm)
+    except Exception as e:
+        print("[WARN] test 実行中に例外が発生しました。学習直後の重みで再試行します:", e)
+        trainer.test(model=model, dataloaders=dm.test_dataloader())
+
+    print(f"\n[DONE] 出力ルート: {OUT_ROOT}\n")
+
 
 if __name__ == "__main__":
     main()
