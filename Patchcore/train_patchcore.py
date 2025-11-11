@@ -1,228 +1,210 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+PatchCore end-to-end runner (version-robust)
+- 学習: normal だけで学習
+- 評価: val/test は normal/abnormal の2クラスで評価
+- anomalib のバージョン差に自動対応（Folder の引数を動的に切替）
+"""
+
 import os
-import glob
+import sys
 import json
+import inspect
 from pathlib import Path
+from typing import Dict, Any, List
 
 import torch
-import pytorch_lightning as pl
-from sklearn.metrics import confusion_matrix, classification_report
-import pandas as pd
+import numpy as np
+import random
 
-# ==== ここだけ環境に合わせて編集 ====
-DATA_ROOT = "/home/yamamao/Patchcore/dataset"  # 下のフォルダ構成を必ず満たすこと
-# DATA_ROOT/
-#   train/ normal/
-#   val/   normal/ abnormal/
-#   test/  normal/ abnormal/
-OUT_ROOT  = "/home/yamamao/Patchcore/py_results"  # 本スクリプトの出力先
+# --------- ユーザー設定（必要なら変更） ----------
+DATA_ROOT = Path("/home/yamamamoao/Patchcore/dataset")
+OUT_ROOT  = Path("/home/yamamamoao/Patchcore/py_results")   # 生成物はここに出力
 MAX_EPOCHS = 1
 BATCH = 32
 NUM_WORKERS = 8
+SEED = 42
 BACKBONE = "resnet50"
 LAYERS = ["layer2", "layer3"]
 CORESET_RATIO = 0.01
-SEED = 42
-# ===================================
+# -----------------------------------------------
 
-# 依存: anomalib==2.x が入っていること
-from anomalib.models import Patchcore
-from anomalib.data import Folder
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
 
 def ensure_dirs():
-    Path(OUT_ROOT).mkdir(parents=True, exist_ok=True)
+    OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-def make_datamodule():
-    """anomalib のバージョン差に合わせて Folder の引数を自動切替"""
+
+def check_required_paths():
+    need = [
+        "train/normal",
+        "val/normal", "val/abnormal",
+        "test/normal", "test/abnormal",
+    ]
+    missing = []
+    for rel in need:
+        p = DATA_ROOT / rel
+        if not p.exists():
+            missing.append(str(p))
+    if missing:
+        raise FileNotFoundError(
+            "必要なフォルダが見つかりません。\n" + "\n".join(missing)
+        )
+
+
+def build_datamodule():
+    """anomalib.data.Folder を、バージョン差に合わせて安全に初期化"""
+    from anomalib.data import Folder  # ここで import（環境にあるものを使う）
+    sig = inspect.signature(Folder.__init__)
+    params = set(sig.parameters.keys())
+
     base = dict(
         name="ladder_dataset",
-        root=DATA_ROOT,
+        root=str(DATA_ROOT),
         train_batch_size=BATCH,
         eval_batch_size=BATCH,
         num_workers=NUM_WORKERS,
     )
 
-    # ---- 方式A: 新しめのAPI（val/test はディレクトリ指定）----
-    try:
-        from anomalib.data import Folder
-        return Folder(
-            **base,
-            normal_dir="train/normal",   # 学習は normal のみ
-            val_dir="val",               # val/ 配下に normal/ abnormal/
-            test_dir="test",             # test/配下に normal/ abnormal/
-            val_split_mode="from_dir",
-            test_split_mode="from_dir",
-        )
-    except TypeError:
-        pass  # この方式が使えない → 次の方式を試す
+    # 候補A: 新しめAPI（val/test をディレクトリ指定）
+    cand_A = dict(
+        **base,
+        normal_dir="train/normal",   # train は normal のみ
+        val_dir="val",               # val/ 以下に normal, abnormal
+        test_dir="test",             # test/ 以下に normal, abnormal
+        val_split_mode="from_dir",
+        test_split_mode="from_dir",
+    )
 
-    # ---- 方式B: 旧API（val/test をクラス別に個別パスで指定）----
-    try:
-        from anomalib.data import Folder
-        return Folder(
-            **base,
-            # train は normal のみ（abnormal は None でOK）
-            normal_dir="train/normal",
-            abnormal_dir=None,
-            # 検証/テストはクラス別にフルパスを渡す
-            normal_val_dir="val/normal",
-            abnormal_val_dir="val/abnormal",
-            normal_test_dir="test/normal",
-            abnormal_test_dir="test/abnormal",
-        )
-    except TypeError as e:
-        raise RuntimeError(
-            "この環境の anomalib.Folder がどちらのシグネチャにも一致しません。"
-            f" 例外: {e}"
-        )
+    # 候補B: 旧API（val/test をクラス別フルパスで指定）
+    cand_B = dict(
+        **base,
+        normal_dir="train/normal",
+        abnormal_dir=None,   # 学習は異常を使わない
+        normal_val_dir="val/normal",
+        abnormal_val_dir="val/abnormal",
+        normal_test_dir="test/normal",
+        abnormal_test_dir="test/abnormal",
+    )
+
+    # 候補C: さらに旧API（root/{train,val,test}/{normal,abnormal} という規約探索）
+    cand_C = dict(
+        **base,
+        normal_dir="normal",
+        abnormal_dir="abnormal",
+        val_split_mode="from_dir",
+        test_split_mode="from_dir",
+    )
+
+    def try_build(cand: Dict[str, Any]):
+        filtered = {k: v for k, v in cand.items() if k in params}
+        return Folder(**filtered)
+
+    for cand in (cand_A, cand_B, cand_C):
+        try:
+            dm = try_build(cand)
+            print(f"[INFO] Folder init succeeded with keys: {sorted({k for k in cand if k in params})}")
+            return dm
+        except TypeError as e:
+            # 次の候補を試す
+            continue
+
+    # どれもダメなら詳細を表示
+    import anomalib
+    raise RuntimeError(
+        "Folder の初期化に失敗しました。\n"
+        f"anomalib version: {getattr(anomalib, '__version__', 'unknown')}\n"
+        f"Folder.__init__ signature: {sig}\n"
+        f"Accepted keys: {sorted(params)}\n"
+    )
 
 
-def make_model() -> Patchcore:
-    return Patchcore(
+def build_model():
+    """Patchcore モデルを生成（バージョン差に耐性）"""
+    from anomalib.models import Patchcore
+    # Patchcore は比較的安定した引数。念のためフィルタする
+    sig = inspect.signature(Patchcore.__init__)
+    params = set(sig.parameters.keys())
+    cand = dict(
         backbone=BACKBONE,
         layers=LAYERS,
         coreset_sampling_ratio=CORESET_RATIO,
     )
+    filtered = {k: v for k, v in cand.items() if k in params}
+    print(f"[INFO] Build Patchcore with keys: {sorted(filtered.keys())}")
+    return Patchcore(**filtered)
 
-def find_ckpt(search_dir: str) -> str | None:
-    """anomalib が作る Lightning チェックポイントをざっくり探索"""
-    pats = [
-        os.path.join(search_dir, "**", "weights", "Lightning", "model.ckpt"),
-        os.path.join(search_dir, "**", "model.ckpt"),
-    ]
-    for pat in pats:
-        hits = glob.glob(pat, recursive=True)
-        if hits:
-            # 一番新しそうなもの
-            return max(hits, key=os.path.getmtime)
-    return None
 
-def extract_preds_to_csv(pred_batches, csv_path: str):
-    """
-    trainer.predict の返り値（バッチのリスト）から
-    汎用的に image_path / label / pred_label / score を吸い出して CSV にする。
-    """
-    rows = []
-    def _todict(x):
-        if isinstance(x, dict):
-            return x
-        # SimpleNamespace や Lightning の特殊オブジェクトにも対応
-        return {k: getattr(x, k) for k in dir(x) if not k.startswith("_")}
+def train_and_test():
+    from pytorch_lightning import Trainer
+    from pytorch_lightning.callbacks import ModelCheckpoint
 
-    for batch in pred_batches:
-        # batch は list[dict] だったり dict[tensor] だったりするので広げる
-        if isinstance(batch, (list, tuple)):
-            items = batch
-        else:
-            items = [batch]
-        for it in items:
-            d = _todict(it)
+    dm = build_datamodule()
+    model = build_model()
 
-            # 代表的キー名を総当たり（2.2系でだいたい拾える）
-            def pick(keys, default=None):
-                for k in keys:
-                    if k in d:
-                        return d[k]
-                # “scores” などテンソルも来るので最後に探索
-                for k, v in d.items():
-                    if any(kk in k for kk in keys):
-                        return v
-                return default
-
-            path  = pick(["image_path", "filepath", "path", "image", "image_name"])
-            label = pick(["label", "target", "gt_label", "ground_truth", "y"])
-            plbl  = pick(["pred_label", "pred_labels", "y_hat", "pred"])
-            score = pick(["pred_score", "anomaly_score", "score", "image_score"])
-
-            # Tensor → 値
-            def to_py(v):
-                if isinstance(v, torch.Tensor):
-                    v = v.detach().cpu()
-                    if v.numel() == 1:
-                        return v.item()
-                    return v.tolist()
-                return v
-
-            rows.append({
-                "image_path": str(path),
-                "label": to_py(label),
-                "pred_label": to_py(plbl),
-                "score": to_py(score),
-            })
-
-    df = pd.DataFrame(rows)
-    df.to_csv(csv_path, index=False)
-    return df
-
-def main():
-    pl.seed_everything(SEED)
-    ensure_dirs()
-
-    dm = make_datamodule()
-    model = make_model()
-    trainer = pl.Trainer(
-        accelerator="auto",
-        max_epochs=MAX_EPOCHS,
-        default_root_dir=OUT_ROOT,
-        log_every_n_steps=1,
-        enable_progress_bar=True,
-        enable_checkpointing=True,
+    ckpt_dir = OUT_ROOT / "weights" / "Lightning"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_cb = ModelCheckpoint(
+        dirpath=str(ckpt_dir),
+        filename="model",
+        save_last=True,
+        save_top_k=1,
+        monitor=None,  # モニタ無指定（メトリクス名がバージョン差で変わるため）
     )
 
-    # ---------- Train ----------
-    trainer.fit(model, datamodule=dm)
+    trainer = Trainer(
+        accelerator="auto",
+        max_epochs=MAX_EPOCHS,
+        default_root_dir=str(OUT_ROOT),
+        enable_progress_bar=True,
+        callbacks=[ckpt_cb],
+        log_every_n_steps=1,
+    )
 
-    # ---------- Locate checkpoint ----------
-    ckpt = (trainer.checkpoint_callback.best_model_path
-            if getattr(trainer, "checkpoint_callback", None)
-            else None)
-    if not ckpt:
-        ckpt = find_ckpt(OUT_ROOT)
-    if not ckpt:
-        raise FileNotFoundError("model.ckpt が見つかりませんでした。学習ログ配下を確認してください。")
+    print("[INFO] === fit() ===")
+    trainer.fit(model=model, datamodule=dm)
 
-    # ---------- Test (AUROC/F1 などを出力) ----------
-    test_metrics = trainer.test(model=model, datamodule=dm, ckpt_path=ckpt)
-    with open(os.path.join(OUT_ROOT, "test_metrics.json"), "w") as f:
-        json.dump(test_metrics, f, indent=2, ensure_ascii=False)
-    print("Test metrics:", test_metrics)
+    print("[INFO] === test() ===")
+    # 予測を Python 側で受け取れるバージョンでは返る。返らない版もあるので try。
+    preds = None
+    try:
+        preds = trainer.test(model=model, datamodule=dm, verbose=True)
+    except TypeError:
+        # 一部の PL で test() が返り値を持たないことがある
+        trainer.test(model=model, datamodule=dm, verbose=True)
 
-    # ---------- Predict (画像毎の予測をCSV化) ----------
-    pred_batches = trainer.predict(model=model, datamodule=dm, ckpt_path=ckpt)
-    csv_path = os.path.join(OUT_ROOT, "predictions.csv")
-    df = extract_preds_to_csv(pred_batches, csv_path)
-    print(f"Saved predictions to: {csv_path}")
+    # 可能なら推定結果をCSV化（preds が dict list の場合）
+    try:
+        if isinstance(preds, list) and len(preds) > 0 and isinstance(preds[0], dict):
+            # メトリクスだけの場合もあるので、そのまま保存
+            with open(OUT_ROOT / "metrics_from_test_return.json", "w") as f:
+                json.dump(preds, f, indent=2)
+            print(f"[INFO] metrics_from_test_return.json を保存しました: {OUT_ROOT}")
+    except Exception as e:
+        print(f"[WARN] test の戻り値保存で例外: {e}")
 
-    # ---------- Confusion Matrix / Report ----------
-    # ラベルが 0/1 でない場合は安全に変換
-    def to01(v):
-        if v in (0, 1):
-            return int(v)
-        # "normal"/"abnormal" や True/False などを吸収
-        s = str(v).lower()
-        if "abnormal" in s or s == "1" or s == "true":
-            return 1
-        return 0
 
-    y_true = [to01(v) for v in df["label"].tolist()]
-    y_pred = [to01(v) for v in df["pred_label"].tolist()]
+def main():
+    set_seed(SEED)
+    ensure_dirs()
+    check_required_paths()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[INFO] device: {device}")
+    train_and_test()
+    print(f"[INFO] 完了。出力: {OUT_ROOT}")
 
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    report = classification_report(y_true, y_pred, labels=[0, 1],
-                                   target_names=["normal", "abnormal"], digits=4)
-
-    cm_csv = os.path.join(OUT_ROOT, "confusion_matrix.csv")
-    pd.DataFrame(cm, index=["true_normal", "true_abnormal"],
-                    columns=["pred_normal", "pred_abnormal"]).to_csv(cm_csv)
-    with open(os.path.join(OUT_ROOT, "classification_report.txt"), "w") as f:
-        f.write(report)
-
-    print("Confusion Matrix:\n", cm)
-    print("Report:\n", report)
-    print(f"Artifacts saved under: {OUT_ROOT}")
 
 if __name__ == "__main__":
-    main()
-
+    try:
+        main()
+    except Exception as e:
+        print("[FATAL]", e)
+        sys.exit(1)
