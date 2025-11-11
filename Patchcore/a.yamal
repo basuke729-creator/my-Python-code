@@ -24,3 +24,22 @@ trainer:
   max_epochs: 1
   default_root_dir: /home/yamamao/Patchcore/results
 
+anomalib --print_config --config /home/yamamao/Patchcore/patchcore_cls.yaml | sed -n '/^data:/,/^trainer:/p'
+
+python - <<'PY'
+from anomalib.data import Folder
+dm = Folder(
+    name="ladder_dataset",
+    root="/home/yamamao/Patchcore/dataset",
+    normal_dir="normal",
+    val_split_mode="from_dir",
+    test_split_mode="from_dir",
+    train_batch_size=32, eval_batch_size=32, num_workers=8
+)
+dm.setup(stage="fit")
+print("train_len:", len(dm.train_data))
+print("has_val:", hasattr(dm, "val_data"))
+if hasattr(dm, "val_data"):
+    print("val_len:", len(dm.val_data))
+PY
+
