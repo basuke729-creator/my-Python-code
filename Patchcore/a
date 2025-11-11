@@ -1,0 +1,97 @@
+#build_results_and_confmat.py
+import argparse
+import csv
+import os
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
+
+def list_files(root):
+    root = Path(root)
+    files = {}
+    for cls in ["normal", "abnormal"]:
+        d = root / cls
+        if d.exists():
+            for p in d.rglob("*"):
+                if p.is_file():
+                    files.setdefault(p.name, {})["pred"] = cls
+    return files
+
+def list_gt(root):
+    root = Path(root)
+    files = {}
+    for cls in ["normal", "abnormal"]:
+        d = root / cls
+        if d.exists():
+            for p in d.rglob("*"):
+                if p.is_file():
+                    files[p.name] = {"gt": cls, "gt_path": str(p)}
+    return files
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gt_test_dir", required=True, help="e.g. /home/yamamao/Patchcore/dataset/test")
+    ap.add_argument("--pred_images_dir", required=True, help="e.g. /home/yamamao/Patchcore/pred_results/Patchcore/ladder_dataset/latest/images")
+    ap.add_argument("--out_dir", required=True, help="where to save results")
+    args = ap.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    gt = list_gt(args.gt_test_dir)
+    pr = list_files(args.pred_images_dir)
+
+    rows = []
+    missing_pred = 0
+    for fname, g in gt.items():
+        gt_label = g["gt"]
+        pred_label = pr.get(fname, {}).get("pred", None)
+        if pred_label is None:
+            missing_pred += 1
+            continue
+        rows.append({
+            "filename": fname,
+            "path": g["gt_path"],
+            "label": gt_label,
+            "pred_label": pred_label,
+            "correct": int(gt_label == pred_label),
+        })
+
+    csv_path = os.path.join(args.out_dir, "results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["filename","path","label","pred_label","correct"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Saved CSV: {csv_path}")
+    if missing_pred:
+        print(f"WARNING: {missing_pred} test files had no predicted image with the same filename.")
+
+    # === Confusion matrix & metrics ===
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        print("No matched predictions. Check filenames and directories.")
+        return
+
+    labels = ["normal", "abnormal"]
+    y_true = df["label"]
+    y_pred = df["pred_label"]
+
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    disp = ConfusionMatrixDisplay(cm, display_labels=labels)
+    fig, ax = plt.subplots(figsize=(5,5))
+    disp.plot(ax=ax, colorbar=False, cmap="viridis", values_format="d")
+    ax.set_title("Confusion Matrix (image-level)")
+    fig.tight_layout()
+    cm_png = os.path.join(args.out_dir, "confusion_matrix.png")
+    fig.savefig(cm_png, dpi=150)
+    print(f"Saved: {cm_png}")
+
+    report = classification_report(y_true, y_pred, labels=labels, digits=4)
+    rep_txt = os.path.join(args.out_dir, "metrics_report.txt")
+    with open(rep_txt, "w", encoding="utf-8") as f:
+        f.write(report + "\n")
+    print(f"Saved: {rep_txt}")
+    print("\n" + report)
+
+if __name__ == "__main__":
+    main()
