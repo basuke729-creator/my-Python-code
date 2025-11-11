@@ -49,19 +49,23 @@ def sanity_check():
           f"test(normal,abnormal)=({n_test_n},{n_test_a})")
 
 def build_datamodule() -> Folder:
-    # 重要：root は "dataset" の親だけを渡し、split はフォルダ構成から自動検出させる
-    #       → train: normal のみ / val & test: normal + abnormal
-    # ここで余計な split 指定は一切しない（過去のエラー原因）
+    # ← ここを差し替え
     dm = Folder(
         name="ladder_dataset",
         root=DATA_ROOT,
-        normal_dir="normal",
-        abnormal_dir="abnormal",
+        # --- 重要ポイント：split ごとのサブフォルダを明示する ---
+        normal_dir="train/normal",             # 学習で使うのは normal のみ
+        normal_val_dir="val/normal",
+        abnormal_val_dir="val/abnormal",
+        normal_test_dir="test/normal",
+        abnormal_test_dir="test/abnormal",
+        # ---------------------------------------------------------
         train_batch_size=BATCH,
         eval_batch_size=BATCH,
         num_workers=NUM_WORKERS,
     )
     return dm
+
 
 def build_model() -> Patchcore:
     # coreset の比率は 0.01 のままでOK。空ストアの場合でも今回は train=0 を防いでいるので通る。
