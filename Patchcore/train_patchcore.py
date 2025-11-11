@@ -34,21 +34,50 @@ from anomalib.data import Folder
 def ensure_dirs():
     Path(OUT_ROOT).mkdir(parents=True, exist_ok=True)
 
-def make_datamodule() -> Folder:
-    """train は normal のみ、val/test は normal+abnormal を from_dir で読む"""
-    dm = Folder(
+def make_datamodule():
+    """anomalib のバージョン差に合わせて Folder の引数を自動切替"""
+    base = dict(
         name="ladder_dataset",
         root=DATA_ROOT,
-        normal_dir="train/normal",  # 学習は正常のみ
-        val_dir="val",              # val/test 側はクラス別サブフォルダ (normal/abnormal) が必須
-        test_dir="test",
-        val_split_mode="from_dir",
-        test_split_mode="from_dir",
         train_batch_size=BATCH,
         eval_batch_size=BATCH,
         num_workers=NUM_WORKERS,
     )
-    return dm
+
+    # ---- 方式A: 新しめのAPI（val/test はディレクトリ指定）----
+    try:
+        from anomalib.data import Folder
+        return Folder(
+            **base,
+            normal_dir="train/normal",   # 学習は normal のみ
+            val_dir="val",               # val/ 配下に normal/ abnormal/
+            test_dir="test",             # test/配下に normal/ abnormal/
+            val_split_mode="from_dir",
+            test_split_mode="from_dir",
+        )
+    except TypeError:
+        pass  # この方式が使えない → 次の方式を試す
+
+    # ---- 方式B: 旧API（val/test をクラス別に個別パスで指定）----
+    try:
+        from anomalib.data import Folder
+        return Folder(
+            **base,
+            # train は normal のみ（abnormal は None でOK）
+            normal_dir="train/normal",
+            abnormal_dir=None,
+            # 検証/テストはクラス別にフルパスを渡す
+            normal_val_dir="val/normal",
+            abnormal_val_dir="val/abnormal",
+            normal_test_dir="test/normal",
+            abnormal_test_dir="test/abnormal",
+        )
+    except TypeError as e:
+        raise RuntimeError(
+            "この環境の anomalib.Folder がどちらのシグネチャにも一致しません。"
+            f" 例外: {e}"
+        )
+
 
 def make_model() -> Patchcore:
     return Patchcore(
