@@ -12,12 +12,15 @@ data:
     root: /home/yamamao/Patchcore/dataset
     normal_dir: normal
     abnormal_dir: abnormal
-    train_batch_size: 32
-    eval_batch_size: 32
+    train_split_mode: from_dir
     val_split_mode: from_dir
     test_split_mode: from_dir
+    train_batch_size: 32
+    eval_batch_size: 32
+    num_workers: 8
 
 trainer:
   accelerator: auto
   max_epochs: 1
+  default_root_dir: /home/yamamao/Patchcore/results
 
