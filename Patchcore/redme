@@ -36,3 +36,12 @@ python build_results_and_confmat.py \
   --gt_test_dir /home/yamamao/Patchcore/dataset/test \
   --pred_images_dir /home/yamamao/Patchcore/pred_results/Patchcore/ladder_dataset/latest/images \
   --out_dir /home/yamamao/Patchcore/test_results
+
+  anomalib test \
+  --config /home/yamamao/Patchcore/patchcore_cls.yaml \
+  --ckpt_path /home/yamamao/Patchcore/results/Patchcore/ladder_dataset/v8/weights/Lightning/model.ckpt \
+  --data.root /home/yamamao/Patchcore/dataset \
+  --data.test_split_mode from_dir \
+  --data.val_split_mode from_dir \
+  --trainer.default_root_dir /home/yamamao/Patchcore/test_results \
+  --return_predictions true
