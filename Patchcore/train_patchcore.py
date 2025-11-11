@@ -1,105 +1,111 @@
-# -*- coding: utf-8 -*-
-"""
-runpatchcore.py  — anomalib v2系で確実に通る最小版
-- train は train/normal だけで学習（One-Class）
-- val/test は normal / abnormal の2クラスで評価
-- あなたの三層フォルダ構成をそのまま使用（train / val / test）
-"""
+# runpatchcore.py
+# 最小で確実に通る PatchCore 実行スクリプト（anomalib v2.x/古いFolder両対応）
 
+from __future__ import annotations
 import os
 import torch
-from pytorch_lightning import Trainer, seed_everything
-from anomalib.models import Patchcore     # LightningModule を返すラッパ
-from anomalib.data import Folder          # LightningDataModule（版により仕様差あり）
+from lightning.pytorch import Trainer
+from anomalib.models import Patchcore
+from anomalib.data import Folder
 
-# === 環境に合わせてここだけ確認 ===
-DATASET_DIR = "/home/yamamoao/Patchcore/dataset"
-TRAIN_ROOT  = os.path.join(DATASET_DIR, "train")
-VAL_ROOT    = os.path.join(DATASET_DIR, "val")
-TEST_ROOT   = os.path.join(DATASET_DIR, "test")
-OUT_DIR     = "/home/yamamoao/Patchcore/results_py"   # 出力先
-MAX_EPOCHS  = 1
+# ========= ユーザー環境に合わせてここだけ確認 =========
+DATA_ROOT = "/home/yamamoao/Patchcore/dataset"      # <- dataset 直下
+TRAIN_ROOT = f"{DATA_ROOT}/train"                   # train/normal だけ
+VAL_ROOT   = f"{DATA_ROOT}/val"                     # val/normal, val/abnormal
+TEST_ROOT  = f"{DATA_ROOT}/test"                    # test/normal, test/abnormal
+OUT_ROOT   = "/home/yamamoao/Patchcore/py_results"   # 出力先
+BATCH = 32
+NUM_WORKERS = 8
+MAX_EPOCHS = 1
+# ====================================================
 
-def assert_dir(p):
+def _assert_dir(p: str):
     if not os.path.isdir(p):
-        raise FileNotFoundError(f"Not found: {p}")
+        raise FileNotFoundError(f"Directory not found: {p}")
 
-def make_dm_for(root_dir: str, use_abnormal: bool):
+def _make_folder_safe(**kwargs) -> Folder:
     """
-    anomalib の Folder は版差が大きいので、
-    どの版でも通るように最小限の引数だけ渡す。
+    anomalib.data.Folder の __init__ が受け付けない引数があっても動かすための
+    フォールバック。まずできるだけ引数付きで生成し、TypeError が出たら
+    最小引数で生成→属性を後から付与します。
     """
-    base_kwargs = dict(
-        root=root_dir,
-        normal_dir="normal",
-    )
-    if use_abnormal:
-        base_kwargs["abnormal_dir"] = "abnormal"   # val/test では必要
-    # train は正常のみなので abnormal_dir は渡さない（古い版だと None も不可）
-
-    # まずは新しめの版で通る形
     try:
-        return Folder(**base_kwargs, train_batch_size=32, eval_batch_size=32, num_workers=8)
+        return Folder(**kwargs)
     except TypeError:
-        # 古い版はバッチサイズなどを __init__ で受け付けない
-        dm = Folder(**base_kwargs)
-        # 代入式も版によっては無視されても害はない
-        for k, v in (("train_batch_size", 32), ("eval_batch_size", 32), ("num_workers", 8)):
-            try:
-                setattr(dm, k, v)
-            except Exception:
-                pass
+        # 最小限の必須引数だけ取り出す
+        minimal = {k: kwargs[k] for k in ("root", "normal_dir") if k in kwargs}
+        if "abnormal_dir" in kwargs:
+            minimal["abnormal_dir"] = kwargs["abnormal_dir"]
+        dm = Folder(**minimal)  # ここは通るはず
+
+        # 受け付けなかったパラメータは属性として後付け（古いFolder想定）
+        for k in ("train_batch_size", "eval_batch_size", "num_workers"):
+            if k in kwargs:
+                setattr(dm, k, kwargs[k])
         return dm
 
+def make_dm_train() -> Folder:
+    """train: 正常のみ。abnormal は渡さない。"""
+    _assert_dir(TRAIN_ROOT)
+    _assert_dir(os.path.join(TRAIN_ROOT, "normal"))
+    return _make_folder_safe(
+        root=TRAIN_ROOT,
+        normal_dir="normal",
+        train_batch_size=BATCH,
+        eval_batch_size=BATCH,
+        num_workers=NUM_WORKERS,
+    )
 
-def build_model():
-    # Patchcore の LightningModule を返すラッパ API（backbone などはここで指定）
+def make_dm_eval(split_root: str) -> Folder:
+    """val/test: normal/abnormal の両方が必要。"""
+    _assert_dir(split_root)
+    _assert_dir(os.path.join(split_root, "normal"))
+    _assert_dir(os.path.join(split_root, "abnormal"))
+    return _make_folder_safe(
+        root=split_root,
+        normal_dir="normal",
+        abnormal_dir="abnormal",
+        train_batch_size=BATCH,
+        eval_batch_size=BATCH,
+        num_workers=NUM_WORKERS,
+    )
+
+def build_model() -> Patchcore:
+    # Patchcore は LightningModule として提供される
     return Patchcore(
         backbone="resnet50",
         layers=["layer2", "layer3"],
         coreset_sampling_ratio=0.01,
     )
 
+def build_trainer() -> Trainer:
+    return Trainer(
+        max_epochs=MAX_EPOCHS,
+        default_root_dir=OUT_ROOT,
+        accelerator="auto",
+        log_every_n_steps=1,
+        enable_checkpointing=True,
+    )
+
 def main():
-    seed_everything(42)
+    torch.manual_seed(42)
 
-    # フォルダ存在チェック（三層構成を前提）
-    assert_dir(os.path.join(TRAIN_ROOT, "normal"))
-    # train に abnormal は不要
-    assert_dir(os.path.join(VAL_ROOT, "normal"))
-    assert_dir(os.path.join(VAL_ROOT, "abnormal"))
-    assert_dir(os.path.join(TEST_ROOT, "normal"))
-    assert_dir(os.path.join(TEST_ROOT, "abnormal"))
-
-    # DataModules を split 別に用意
-    dm_train = make_dm_for(TRAIN_ROOT, split="train", use_abnormal=False)
-    dm_val   = make_dm_for(VAL_ROOT,   split="val",   use_abnormal=True)
-    dm_test  = make_dm_for(TEST_ROOT,  split="test",  use_abnormal=True)
+    # datamodule を分離して作成（古い Folder と相性が良い）
+    dm_train = make_dm_train()
+    dm_val   = make_dm_eval(VAL_ROOT)
+    dm_test  = make_dm_eval(TEST_ROOT)
 
     model = build_model()
+    trainer = build_trainer()
 
-    trainer = Trainer(
-        accelerator="auto",
-        max_epochs=MAX_EPOCHS,
-        default_root_dir=OUT_DIR,
-        log_every_n_steps=1,
-        enable_progress_bar=True,
-    )
+    # 学習：train でメモリバンクを構築
+    trainer.fit(model=model, datamodule=dm_train)
 
-    # --- fit (train + val) ---
-    # 版差を吸収するため、DataLoader を明示的に渡す
-    trainer.fit(
-        model,
-        train_dataloaders=dm_train.train_dataloader(),
-        val_dataloaders=dm_val.val_dataloader(),
-    )
+    # 検証（ベスト ckpt があれば自動で使われる。無ければ最新 weights）
+    trainer.validate(model=model, datamodule=dm_val, ckpt_path="best")
 
-    # --- test ---
-    trainer.test(model, dataloaders=dm_test.test_dataloader())
-
-    # 予測画像やメトリクス類は OUT_DIR 以下に保存されます
-    print(f"[INFO] Done. See results in: {OUT_DIR}")
+    # テスト
+    trainer.test(model=model, datamodule=dm_test, ckpt_path="best")
 
 if __name__ == "__main__":
     main()
-
