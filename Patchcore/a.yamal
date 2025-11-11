@@ -1,35 +1,33 @@
 model:
   class_path: anomalib.models.Patchcore
   init_args:
-    backbone: resnet50
-    layers: [layer2, layer3]
+    backbone: "resnet50"
+    layers: ["layer2", "layer3"]
     coreset_sampling_ratio: 0.01
 
 data:
   class_path: anomalib.data.Folder
   init_args:
-    name: ladder_dataset
-    root: /home/yamamao/Patchcore/dataset
-    # フォルダ構成（絶対にこの形）
-    # dataset/
-    #   train/ normal/
-    #   val/   normal/ abnormal/
-    #   test/  normal/ abnormal/
-    train_dir: train
-    val_dir: val
-    test_dir: test
-    normal_dir: normal
-    abnormal_dir: abnormal
-    # “from_dir” を使うので自動 split は一切しない
-    val_split_mode: from_dir
-    test_split_mode: from_dir
+    name: "ladder_dataset"
+    root: "/home/yamamao/Patchcore/dataset"
+
+    # 学習は normal のみ
+    normal_dir: "train/normal"
+
+    # 検証（val）
+    normal_val_dir: "val/normal"
+    abnormal_val_dir: "val/abnormal"
+
+    # テスト（test）
+    normal_test_dir: "test/normal"
+    abnormal_test_dir: "test/abnormal"
+
     train_batch_size: 32
     eval_batch_size: 32
     num_workers: 8
 
 trainer:
-  accelerator: auto
+  accelerator: "auto"
   max_epochs: 1
-  default_root_dir: /home/yamamao/Patchcore/results
-
+  default_root_dir: "/home/yamamao/Patchcore/results"
 
