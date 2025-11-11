@@ -24,26 +24,33 @@ def assert_dir(p):
     if not os.path.isdir(p):
         raise FileNotFoundError(f"Not found: {p}")
 
-def make_dm_for(root_dir: str, split: str, use_abnormal: bool):
-    """anomalib の Folder は版差があり、dir 指定系引数が通らない版では
-    root を split ごとに切り替えるのが最も確実。"""
-    kwargs = dict(
+def make_dm_for(root_dir: str, use_abnormal: bool):
+    """
+    anomalib の Folder は版差が大きいので、
+    どの版でも通るように最小限の引数だけ渡す。
+    """
+    base_kwargs = dict(
         root=root_dir,
         normal_dir="normal",
-        task="classification",
-        # 旧版でも安全な共通引数だけ渡す
-        train_batch_size=32,
-        eval_batch_size=32,
-        num_workers=8,
     )
     if use_abnormal:
-        kwargs["abnormal_dir"] = "abnormal"   # val/test は必要
-    else:
-        kwargs["abnormal_dir"] = None         # train は正常のみ学習
+        base_kwargs["abnormal_dir"] = "abnormal"   # val/test では必要
+    # train は正常のみなので abnormal_dir は渡さない（古い版だと None も不可）
 
-    # ここで split は DataModule 側で自動判定される版が多い
-    # （明示 split 引数がある版でも不要）
-    return Folder(**kwargs)
+    # まずは新しめの版で通る形
+    try:
+        return Folder(**base_kwargs, train_batch_size=32, eval_batch_size=32, num_workers=8)
+    except TypeError:
+        # 古い版はバッチサイズなどを __init__ で受け付けない
+        dm = Folder(**base_kwargs)
+        # 代入式も版によっては無視されても害はない
+        for k, v in (("train_batch_size", 32), ("eval_batch_size", 32), ("num_workers", 8)):
+            try:
+                setattr(dm, k, v)
+            except Exception:
+                pass
+        return dm
+
 
 def build_model():
     # Patchcore の LightningModule を返すラッパ API（backbone などはここで指定）
