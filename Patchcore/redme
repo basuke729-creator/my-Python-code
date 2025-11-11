@@ -16,3 +16,18 @@ anomalib train --config /home/yamamao/Patchcore/patchcore_cls.yaml
 
 anomalib --print_config --config /home/yamamao/Patchcore/patchcore_cls.yaml | grep -A2 -n "data:"
 anomalib --print_config --config /home/yamamao/Patchcore/patchcore_cls.yaml | grep -n "val_split_mode\|test_split_mode\|root\|normal_dir\|abnormal_dir"
+
+anomalib predict \
+  --config /home/yamamao/Patchcore/patchcore_cls.yaml \
+  --ckpt_path /home/yamamao/Patchcore/results/Patchcore/ladder_dataset/v8/weights/Lightning/model.ckpt \
+  data.root=/home/yamamao/Patchcore/dataset \
+  data.test_split_mode=from_dir \
+  trainer.default_root_dir=/home/yamamao/Patchcore/pred_results
+
+anomalib predict \
+  --config /home/yamamao/Patchcore/patchcore_cls.yaml \
+  --ckpt_path /home/yamamao/Patchcore/results/Patchcore/ladder_dataset/v8/weights/Lightning/model.ckpt \
+  data.root=/home/yamamao/Patchcore/datase \
+  data.normal_dir=normal \
+  data.abnormal_dir=abnormal \
+  trainer.default_root_dir=/home/yamamao/Patchcore/pred_results
