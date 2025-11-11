@@ -45,3 +45,5 @@ python build_results_and_confmat.py \
   --data.val_split_mode from_dir \
   --trainer.default_root_dir /home/yamamao/Patchcore/test_results \
   --return_predictions true
+
+  python -c "import anomalib, lightning; print('anomalib', anomalib.__version__); print('lightning', lightning.__version__)"
