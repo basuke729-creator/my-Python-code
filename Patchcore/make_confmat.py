@@ -1,43 +1,53 @@
-import json, os, csv
-from pathlib import Path
+import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
-# === 入力: 元データと推論出力のパスを環境に合わせて ===
-DATA_ROOT = Path("/home/yamamao/Patchcore/dataset/test")  # test のGT
-PRED_ROOT = Path("/home/yamamao/Patchcore/pred_results/predict")  # predict の出力
-OUT_PNG   = Path("/home/yamamao/Patchcore/pred_results/confusion_matrix.png")
+# ★ここを results.csv のフルパスに書き換える
+CSV_PATH = "/home/yamamao/Patchcore/results/patchcore/ladder_dataset/version_0/results.csv"
 
-# GT 取得（ファイル名 -> ラベル）
-gt = {}
-for cls in ["normal","abnormal"]:
-    for p in (DATA_ROOT/cls).glob("*.jpg"):
-        gt[p.name] = cls
-    for p in (DATA_ROOT/cls).glob("*.png"):
-        gt[p.name] = cls
+def main():
+    df = pd.read_csv(CSV_PATH)
 
-# 予測ラベル取得（ファイル名 -> ラベル）
-# ※ anomalib predict の出力が images/<pred_cls>/ に分かれている前提
-pred = {}
-for cls in ["normal","abnormal"]:
-    d = PRED_ROOT / "images" / cls
-    if d.exists():
-        for p in d.glob("*.*"):
-            pred[p.name] = cls
+    print("==== columns in results.csv ====")
+    print(df.columns)
 
-# マッチするファイルだけで評価
-y_true, y_pred = [], []
-for fname, y in gt.items():
-    if fname in pred:
-        y_true.append(0 if y=="normal" else 1)
-        y_pred.append(0 if pred[fname]=="normal" else 1)
+    """
+    anomalib のバージョンによって列名が違う可能性があります。
+    よくあるパターンの例：
 
-# 混同行列
-cm = confusion_matrix(y_true, y_pred, labels=[0,1])
-disp = ConfusionMatrixDisplay(cm, display_labels=["normal","abnormal"])
-disp.plot(values_format="d")
-plt.title("Confusion Matrix (image-level)")
-plt.tight_layout()
-OUT_PNG.parent.mkdir(parents=True, exist_ok=True)
-plt.savefig(OUT_PNG, dpi=180)
-print(f"saved: {OUT_PNG}")
+      - "image_path", "label", "pred_label"
+      - "image_path", "gt_label", "pred_label"
+      - 0/1 のラベルで normal=0, abnormal=1
+
+    下の行の 'label_col', 'pred_col' を
+    print(df.columns) の結果に合わせて書き換えてください。
+    """
+
+    # 例: 'label' が正解ラベル, 'pred_label' が予測ラベルだった場合
+    label_col = "label"        # 正解ラベルの列名
+    pred_col = "pred_label"    # 予測ラベルの列名
+
+    if label_col not in df.columns or pred_col not in df.columns:
+        raise RuntimeError(
+            f"列名が合っていません。現在の列: {list(df.columns)}\n"
+            f"label_col={label_col}, pred_col={pred_col} を実データに合わせて直してください。"
+        )
+
+    y_true = df[label_col].values
+    y_pred = df[pred_col].values
+
+    # ラベルが文字列（"normal"/"abnormal" など）の場合はそのまま使う
+    labels = sorted(list(set(y_true) | set(y_pred)))
+
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    print("Confusion matrix:\n", cm)
+
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    disp.plot(cmap="Blues")
+    plt.title("Confusion Matrix (Patchcore)")
+    plt.tight_layout()
+    plt.savefig("confusion_matrix_patchcore.png", dpi=200)
+    print("confusion_matrix_patchcore.png を作成しました。")
+
+if __name__ == "__main__":
+    main()
