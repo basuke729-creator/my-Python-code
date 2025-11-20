@@ -31,3 +31,28 @@ trainer:
   max_epochs: 1
   default_root_dir: "/home/yamamao/Patchcore/results"
 
+data:
+  class_path: anomalib.data.Folder
+  init_args:
+    name: ladder_dataset
+    root: /home/yamamao/Patchcore/dataset
+
+    # フォルダ名（↑で作った3つ）
+    normal_dir: normal
+    abnormal_dir: abnormal
+    normal_test_dir: normal_test
+
+    # 分類タスク
+    task: classification
+
+    # 画像サイズやバッチサイズ
+    image_size: 256         # 必要なら 224 等に変更可
+    train_batch_size: 32
+    test_batch_size: 32     # anomalib では eval_batch_size ではなく test_batch_size の版が多いです
+    num_workers: 8
+
+    # normal から test へ追加で分割しない
+    split_ratio: 0.0
+
+    # 検証用データセットを test から自動で半分切り出す
+    create_validation_set: true
