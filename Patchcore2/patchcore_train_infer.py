@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from sklearn.metrics import roc_curve, confusion_matrix, ConfusionMatrixDisplay, classification_report
+from sklearn.metrics import roc_curve, confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 
 # ===============================
@@ -20,7 +20,7 @@ NUM_WORKERS = 4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 MEMORY_BANK_PATH = "memory_bank.npy"
-CONF_MAT_PATH = "confusion_matrix.png"
+CONF_MAT_PATH = "confusion_matrix_norm.png"  # ★ 正規化版の画像ファイル名
 
 
 # ===============================
@@ -51,9 +51,9 @@ print("test:",  test_dataset.classes)
 # ===============================
 # backbone（ResNet18）
 # ===============================
-from torchvision.models import resnet18
+from torchvision.models import resnet18, ResNet18_Weights
 
-backbone = resnet18(weights="IMAGENET1K_V1")
+backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
 backbone.fc = nn.Identity()   # 最終層を無効化（特徴ベクトルだけ取得）
 backbone = backbone.to(DEVICE)
 backbone.eval()
@@ -136,7 +136,7 @@ test_scores, test_labels = get_scores_and_labels(test_loader, test_dataset)
 pred = (test_scores >= best_threshold).astype(int)
 
 cm = confusion_matrix(test_labels, pred)
-print("Confusion Matrix:\n", cm)
+print("Confusion Matrix (counts):\n", cm)
 
 print("\nClassification Report:")
 print(classification_report(
@@ -146,14 +146,37 @@ print(classification_report(
 
 
 # ===============================
-# 混同行列の保存（PNG）
+# 混同行列（行正規化＆%表示）の画像保存
 # ===============================
-disp = ConfusionMatrixDisplay(cm, display_labels=["normal", "abnormal"])
-disp.plot()
-plt.title("PatchCore (ResNet18 kNN) Confusion Matrix")
+labels = ["normal", "abnormal"]
+
+# 行ごと（Trueごと）に 0〜100% に正規化
+cm_float = cm.astype(np.float64)
+row_sums = cm_float.sum(axis=1, keepdims=True)
+cm_norm = np.divide(cm_float, row_sums, where=row_sums != 0) * 100.0  # 百分率
+
+fig, ax = plt.subplots(figsize=(5, 5))
+im = ax.imshow(cm_norm, interpolation="nearest", cmap="Blues", vmin=0, vmax=100)
+cbar = fig.colorbar(im, ax=ax)
+cbar.set_label("Percentage (%)")
+
+ax.set_xticks(np.arange(len(labels)))
+ax.set_yticks(np.arange(len(labels)))
+ax.set_xticklabels(labels)
+ax.set_yticklabels(labels)
+ax.set_xlabel("Predicted label")
+ax.set_ylabel("True label")
+ax.set_title("PatchCore (ResNet18 kNN)\nConfusion Matrix (row-normalized, %)")
+
+# マスの中に%を表示（小数1桁）
+for i in range(cm_norm.shape[0]):
+    for j in range(cm_norm.shape[1]):
+        ax.text(j, i, f"{cm_norm[i, j]:.1f}",
+                ha="center", va="center", color="black")
+
 plt.tight_layout()
 plt.savefig(CONF_MAT_PATH, dpi=300)
 plt.close()
 
-print(f"\nSaved confusion matrix as: {CONF_MAT_PATH}")
+print(f"\nSaved normalized confusion matrix as: {CONF_MAT_PATH}")
 
