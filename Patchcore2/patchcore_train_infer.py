@@ -125,10 +125,14 @@ def get_scores_and_labels(loader, dataset):
         for imgs, labs in loader:
             imgs = imgs.to(DEVICE)
 
-            out = model(imgs)
-            anom = out["anomaly_score"].cpu().numpy()
+            # ★ PatchCore の正しい推論方法
+            out = model(imgs, return_predictions=True)
 
-            scores.extend(anom)
+            # ★ out は dict 形式 →
+            #   anomaly_score / anomaly_map / features が全て入っている
+            anomaly_scores = out["anomaly_score"].cpu().numpy()
+
+            scores.extend(anomaly_scores)
             labels.extend([class_to_binary[int(l)] for l in labs])
 
     return np.array(scores), np.array(labels)
