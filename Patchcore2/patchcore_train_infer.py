@@ -6,44 +6,80 @@ from torch.utils.data import DataLoader
 from torchvision import transforms, datasets
 
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
+from sklearn.metrics import (
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    classification_report,
+    roc_curve,
+)
 import numpy as np
 
+# anomalib 関連
 from anomalib.models.image import Patchcore
 from anomalib.engine import Engine
 
-# =========================
-# ユーザー設定エリア
-# =========================
-DATASET_ROOT = "dataset_root"  # あなたのデータセットルートに変更
-IMAGE_SIZE = 256               # リサイズサイズ
+# =========================================================
+# ★★ ここだけ書き換えれば基本 OK という設定ゾーン ★★
+# =========================================================
+# データセットのルートフォルダ
+DATASET_ROOT = r"./dataset_root"  # ← あなたの環境に合わせてパスを変更
+
+# クラス名（フォルダ名）をここで定義
+NORMAL_CLASS_NAME = "normal"      # 安全クラスのフォルダ名
+ABNORMAL_CLASS_NAME = "abnormal"  # 危険クラスのフォルダ名
+
+IMAGE_SIZE = 256
 BATCH_SIZE = 8
 NUM_WORKERS = 4
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_SAVE_PATH = "patchcore_checkpoint.ckpt"
+# =========================================================
+
 
 # =========================
-# データセット定義
+# 変換（前処理）
 # =========================
 transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     transforms.ToTensor(),
 ])
 
-# train：normalのみを使う
+# =========================
+# データセット作成
+# =========================
 train_dataset = datasets.ImageFolder(
     root=os.path.join(DATASET_ROOT, "train"),
     transform=transform
 )
 
-# test：normal / abnormal 両方をそのまま読み込み
+val_dataset = datasets.ImageFolder(
+    root=os.path.join(DATASET_ROOT, "val"),
+    transform=transform
+)
+
 test_dataset = datasets.ImageFolder(
     root=os.path.join(DATASET_ROOT, "test"),
     transform=transform
 )
 
+print("=== Classes check ===")
+print("Train classes:", train_dataset.classes)
+print("Val   classes:", val_dataset.classes)
+print("Test  classes:", test_dataset.classes)
+
+# 【重要】フォルダ名とクラス名が合っているか確認
+assert NORMAL_CLASS_NAME in val_dataset.classes, f"{NORMAL_CLASS_NAME} が val にありません"
+assert ABNORMAL_CLASS_NAME in val_dataset.classes, f"{ABNORMAL_CLASS_NAME} が val にありません"
+
+# torch.utils.data.DataLoader
 train_loader = DataLoader(
     train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+    num_workers=NUM_WORKERS, pin_memory=True
+)
+
+val_loader = DataLoader(
+    val_dataset, batch_size=BATCH_SIZE, shuffle=False,
     num_workers=NUM_WORKERS, pin_memory=True
 )
 
@@ -52,107 +88,104 @@ test_loader = DataLoader(
     num_workers=NUM_WORKERS, pin_memory=True
 )
 
-print("Train classes:", train_dataset.classes)
-print("Test classes:", test_dataset.classes)
-# ここで train: ['normal'], test: ['abnormal', 'normal'] のように出ていればOK
-
 # =========================
 # PatchCore モデルの用意
 # =========================
-# imagenetの特徴量を利用する構成
 model = Patchcore(
-    backbone="resnet18",      # 軽量モデル（重くても良ければ wide_resnet50_2 等）
+    backbone="resnet18",
     pre_trained=True,
     layers=["layer2", "layer3"],
-    input_size=(IMAGE_SIZE, IMAGE_SIZE)
+    input_size=(IMAGE_SIZE, IMAGE_SIZE),
 ).to(DEVICE)
 
 engine = Engine(model=model, device=DEVICE)
 
 # =========================
-# 1. 学習 (normalのみ)
+# 1. 学習（train: normal のみを使用）
 # =========================
-print("=== Training PatchCore on normal images only ===")
+# PatchCore 的には "normal" しか学習しないのが前提なので、
+# train データは normal のみを入れておく運用にしておくのがベスト。
+print("=== Training PatchCore on train/normal ===")
 engine.fit(train_loader)
 
-# 学習済みモデルを保存
+# モデル保存
 torch.save(model.state_dict(), MODEL_SAVE_PATH)
 print(f"Saved model to {MODEL_SAVE_PATH}")
 
-# =========================
-# 2. 推論（test: normal & abnormal）
-# =========================
-print("=== Inference on test set ===")
-model.eval()
-
-all_scores = []   # 異常スコア
-all_labels = []   # 正解ラベル (0=normal, 1=abnormal)
-
-with torch.no_grad():
-    for imgs, labels in test_loader:
-        imgs = imgs.to(DEVICE)
-        # PatchCore は forwardで anomaly map / score を返す
-        outputs = model(imgs)
-        # outputs は dict 形式の場合が多いので確認
-        # anomalib>=1.0系だと outputs["anomaly_score"] など
-        if isinstance(outputs, dict):
-            scores = outputs["anomaly_score"].detach().cpu().numpy()
-        else:
-            # 万が一辞書でない実装の場合の保険
-            scores = outputs.detach().cpu().numpy()
-
-        # test_dataset.classes の index を 0/1 にマップする
-        # 例: test_dataset.classes == ['abnormal', 'normal'] の場合
-        #   label=0 -> abnormal(1)
-        #   label=1 -> normal(0)
-        class_to_binary = {
-            test_dataset.class_to_idx["normal"]: 0,
-            test_dataset.class_to_idx["abnormal"]: 1,
-        }
-
-        bin_labels = [class_to_binary[int(l)] for l in labels]
-
-        all_scores.extend(scores)
-        all_labels.extend(bin_labels)
-
-all_scores = np.array(all_scores).reshape(-1)
-all_labels = np.array(all_labels).reshape(-1)
-
-print("Scores shape:", all_scores.shape)
-print("Labels shape:", all_labels.shape)
 
 # =========================
-# 3. 閾値決定
+# ヘルパー：クラスID → 0/1（normal/abnormal）変換
 # =========================
-# 簡単な決め方の例：
-#   validation があればそこで決めるのがベストだが、
-#   今回は test セット全体で Youden J 最大となる閾値を探索
-from sklearn.metrics import roc_curve
+def make_class_to_binary_map(dataset):
+    """ImageFolder の class_to_idx から 0/1 ラベル用の dict を作る"""
+    c2i = dataset.class_to_idx
+    return {
+        c2i[NORMAL_CLASS_NAME]: 0,
+        c2i[ABNORMAL_CLASS_NAME]: 1,
+    }
 
-fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
+
+def get_scores_and_labels(data_loader, dataset, model, device):
+    """指定の DataLoader から異常スコアと 0/1 ラベルを取得"""
+    model.eval()
+    all_scores = []
+    all_labels = []
+
+    class_to_binary = make_class_to_binary_map(dataset)
+
+    with torch.no_grad():
+        for imgs, labels in data_loader:
+            imgs = imgs.to(device)
+            outputs = model(imgs)
+
+            # anomalib の Patchcore は一般的に dict を返す想定
+            if isinstance(outputs, dict):
+                scores = outputs["anomaly_score"].detach().cpu().numpy()
+            else:
+                scores = outputs.detach().cpu().numpy()
+
+            bin_labels = [class_to_binary[int(l)] for l in labels]
+
+            all_scores.extend(scores)
+            all_labels.extend(bin_labels)
+
+    all_scores = np.array(all_scores).reshape(-1)
+    all_labels = np.array(all_labels).reshape(-1)
+    return all_scores, all_labels
+
+
+# =========================
+# 2. val で閾値を決定
+# =========================
+print("=== Inference on validation set (for threshold) ===")
+val_scores, val_labels = get_scores_and_labels(val_loader, val_dataset, model, DEVICE)
+
+print("Val scores shape:", val_scores.shape)
+print("Val labels shape:", val_labels.shape)
+
+fpr, tpr, thresholds = roc_curve(val_labels, val_scores)
 youden_j = tpr - fpr
 best_idx = np.argmax(youden_j)
 best_threshold = thresholds[best_idx]
 
-print(f"Best threshold by Youden J: {best_threshold:.4f}")
+print(f"Best threshold by Youden J on val: {best_threshold:.4f}")
+
 
 # =========================
-# 4. 安全/危険の2値判定
+# 3. test で最終評価（混同行列）
 # =========================
-# score >= threshold → 異常(1 = 危険姿勢)
-# score <  threshold → 正常(0 = 安全姿勢)
-pred_labels = (all_scores >= best_threshold).astype(int)
+print("=== Inference on test set (final evaluation) ===")
+test_scores, test_labels = get_scores_and_labels(test_loader, test_dataset, model, DEVICE)
 
-# =========================
-# 5. 混同行列 & レポート
-# =========================
-cm = confusion_matrix(all_labels, pred_labels, labels=[0, 1])
+pred_labels = (test_scores >= best_threshold).astype(int)
+
+cm = confusion_matrix(test_labels, pred_labels, labels=[0, 1])
 print("Confusion Matrix (rows=true, cols=pred):")
 print(cm)
 
 print("\nClassification report:")
 print(classification_report(
-    all_labels, pred_labels,
+    test_labels, pred_labels,
     target_names=["normal (safe)", "abnormal (danger)"]
 ))
 
@@ -161,6 +194,7 @@ disp = ConfusionMatrixDisplay(
     display_labels=["normal (safe)", "abnormal (danger)"]
 )
 disp.plot()
-plt.title("Confusion Matrix - PatchCore")
+plt.title("Confusion Matrix - PatchCore (test set)")
 plt.tight_layout()
 plt.show()
+
