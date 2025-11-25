@@ -1,116 +1,137 @@
+# predict_patchcore.py
+# 学習済み Patchcore モデルで test データを推論し、
+# confusion matrix と results.csv を出力するスクリプト
+
 import os
 import numpy as np
 import torch
-from torchvision import transforms
-from PIL import Image
+from pytorch_lightning import Trainer
+
+from anomalib.data import Folder
+from anomalib.models.image.patchcore import PatchcoreLightning
+
 from sklearn.metrics import confusion_matrix, classification_report
-import seaborn as sns
+import pandas as pd
 import matplotlib.pyplot as plt
-
-from anomalib.models.image.patchcore.torch_model import PatchcoreModel
-from anomalib.data.utils import read_image
+import seaborn as sns
 
 
-# ==========================================
-# 1) ここをあなたの環境に変更
-# ==========================================
-MODEL_CKPT = "/home/yamamao/Patchcore/results/Patchcore/ladder_dataset/v23/weights/lightning/model.ckpt"
+# ========= ここだけ環境に合わせて確認 =========
+DATA_ROOT = "/home/yamamao/Patchcore/dataset"
+MODEL_CKPT = "/home/yamamao/Patchcore/results/Patchcore/ladder_dataset/v23/weights/Lightning/model.ckpt"
+OUT_DIR = "/home/yamamao/Patchcore/test_results"
+# ===========================================
 
-DATASET_ROOT = "/home/yamamao/Patchcore/dataset/test"
-NORMAL_DIR = os.path.join(DATASET_ROOT, "normal")
-ABNORMAL_DIR = os.path.join(DATASET_ROOT, "abnormal")
-
-OUTPUT_DIR = "/home/yamamao/Patchcore/predict_results"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-# ==========================================
+os.makedirs(OUT_DIR, exist_ok=True)
 
 
-# ==============================
-# 2) 推論モデルの読み込み
-# ==============================
-print("[INFO] Loading model...")
-model = PatchcoreModel.load_from_checkpoint(MODEL_CKPT)
-model.eval().cuda()
+def build_datamodule() -> Folder:
+    """anomalib.data.Folder を使って datamodule を作成（train と同じ設定）"""
+    datamodule = Folder(
+        name="ladder_dataset",
+        root=DATA_ROOT,
+        normal_dir="train/normal",
+        abnormal_dir="train/abnormal",
+        normal_test_dir="test/normal",
+        abnormal_test_dir="test/abnormal",
+        normal_split_ratio=0.0,
+        train_batch_size=32,
+        test_batch_size=32,
+        num_workers=8,
+    )
+    datamodule.setup()  # train/val/test を準備（今回は test だけ使う）
+    return datamodule
 
 
-# ==============================
-# 3) 前処理
-# ==============================
-transform = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.ToTensor(),
-])
+def main():
+    print("[INFO] Building datamodule...")
+    dm = build_datamodule()
+
+    print("[INFO] Loading model from checkpoint...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model: PatchcoreLightning = PatchcoreLightning.load_from_checkpoint(
+        MODEL_CKPT,
+        map_location=device,
+    )
+    model.eval()
+
+    trainer = Trainer(accelerator="auto", logger=False, enable_checkpointing=False)
+
+    print("[INFO] Running prediction on test set...")
+    # trainer.predict の戻り値は「バッチごとの dict のリスト」
+    pred_batches = trainer.predict(model=model, datamodule=dm)
+
+    y_true_list = []
+    y_score_list = []
+
+    for batch_out in pred_batches:
+        # anomalib の PatchcoreLightning は image-level のスコアを pred_score に入れてくる想定
+        if "pred_score" in batch_out:
+            scores = batch_out["pred_score"]
+        elif "image_score" in batch_out:
+            scores = batch_out["image_score"]
+        else:
+            raise KeyError(f"pred_score / image_score が見つかりません: {batch_out.keys()}")
+
+        labels = batch_out["label"]
+
+        y_true_list.append(labels.detach().cpu().numpy())
+        y_score_list.append(scores.detach().cpu().numpy())
+
+    y_true = np.concatenate(y_true_list)   # 0=normal, 1=abnormal
+    y_score = np.concatenate(y_score_list)
+
+    # ====== スコア → 予測ラベルへの変換（閾値） ======
+    try:
+        # anomalib の image_threshold（バージョンによって value の有無が違うので両対応）
+        thr = float(getattr(model.image_threshold, "value", model.image_threshold))
+    except Exception:
+        # 万一取れなければ ROC 的な意味で 0.5 を仮の閾値とする
+        thr = 0.5
+    print(f"[INFO] Using image threshold: {thr}")
+
+    y_pred = (y_score > thr).astype(int)
+
+    # ====== confusion matrix とレポート ======
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    print("[INFO] Confusion matrix (normal=0, abnormal=1):")
+    print(cm)
+    print()
+    print("[INFO] Classification report:")
+    print(classification_report(y_true, y_pred, target_names=["normal", "abnormal"]))
+
+    # ====== CSV 保存 ======
+    df = pd.DataFrame(
+        {
+            "y_true": y_true,
+            "score": y_score,
+            "y_pred": y_pred,
+        }
+    )
+    csv_path = os.path.join(OUT_DIR, "results.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"[INFO] Saved results.csv to: {csv_path}")
+
+    # ====== confusion matrix 画像保存 ======
+    plt.figure(figsize=(5, 5))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=["normal", "abnormal"],
+        yticklabels=["normal", "abnormal"],
+    )
+    plt.xlabel("Predicted label")
+    plt.ylabel("True label")
+    plt.title("Confusion Matrix (image-level)")
+    plt.tight_layout()
+
+    cm_path = os.path.join(OUT_DIR, "confusion_matrix.png")
+    plt.savefig(cm_path)
+    plt.close()
+    print(f"[INFO] Saved confusion matrix image to: {cm_path}")
 
 
-# ==============================
-# 4) 画像を読み推論する関数
-# ==============================
-def infer(img_path):
-    img = read_image(img_path)
-    img = Image.fromarray(img)
-    img = transform(img).unsqueeze(0).cuda()
-
-    with torch.no_grad():
-        outputs = model(img)
-
-    score = outputs["pred_scores"].item()
-    label = 1 if score > 0.5 else 0  # 0: normal, 1: abnormal
-    return label, score
-
-
-# ==============================
-# 5) データセットを推論
-# ==============================
-y_true = []
-y_pred = []
-
-def run_inference(folder, true_label):
-    for f in sorted(os.listdir(folder)):
-        if not f.lower().endswith(("jpg", "jpeg", "png")):
-            continue
-
-        path = os.path.join(folder, f)
-        pred, score = infer(path)
-
-        y_true.append(true_label)
-        y_pred.append(pred)
-
-        print(f"{path} → pred={pred}, score={score:.4f}")
-
-
-print("[INFO] Running inference (normal)...")
-run_inference(NORMAL_DIR, 0)
-
-print("[INFO] Running inference (abnormal)...")
-run_inference(ABNORMAL_DIR, 1)
-
-
-# ==============================
-# 6) Confusion Matrix を作成
-# ==============================
-print("\n=== Confusion Matrix ===")
-cm = confusion_matrix(y_true, y_pred)
-print(cm)
-
-plt.figure(figsize=(6, 5))
-sns.heatmap(cm, annot=True, fmt="d",
-            xticklabels=["Normal", "Abnormal"],
-            yticklabels=["Normal", "Abnormal"],
-            cmap="Blues")
-plt.title("Confusion Matrix")
-plt.xlabel("Predicted")
-plt.ylabel("True")
-plt.savefig(os.path.join(OUTPUT_DIR, "confusion_matrix.png"))
-plt.close()
-
-
-# ==============================
-# 7) classification report
-# ==============================
-report = classification_report(y_true, y_pred, target_names=["Normal", "Abnormal"])
-print(report)
-
-with open(os.path.join(OUTPUT_DIR, "classification_report.txt"), "w") as f:
-    f.write(report)
-
-print(f"[INFO] Results saved to: {OUTPUT_DIR}")
+if __name__ == "__main__":
+    main()
