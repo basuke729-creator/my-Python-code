@@ -1,53 +1,43 @@
 import os
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from torchvision import transforms, datasets
+from torchvision import datasets, transforms
 
 import matplotlib.pyplot as plt
-from sklearn.metrics import (
-    confusion_matrix,
-    ConfusionMatrixDisplay,
-    classification_report,
-    roc_curve,
-)
-import numpy as np
+from sklearn.metrics import roc_curve, confusion_matrix, ConfusionMatrixDisplay, classification_report
 
-# anomalib 関連
-from anomalib.models.image import Patchcore
-from anomalib.engine import Engine
+# --------------------------------------------------------
+# ★★★ ここだけ環境に合わせて書き換えればOK ★★★
+# --------------------------------------------------------
+DATASET_ROOT = "/home/yamamao/Patchcore/dataset"  # ← ここを合わせる
 
-# =========================================================
-# ★★ ここだけ書き換えれば基本 OK という設定ゾーン ★★
-# =========================================================
-# データセットのルートフォルダ
-DATASET_ROOT = r"./dataset_root"  # ← あなたの環境に合わせてパスを変更
+NORMAL_CLASS_NAME = "normal"
+ABNORMAL_CLASS_NAME = "abnormal"
 
-# クラス名（フォルダ名）をここで定義
-NORMAL_CLASS_NAME = "normal"      # 安全クラスのフォルダ名
-ABNORMAL_CLASS_NAME = "abnormal"  # 危険クラスのフォルダ名
-
-IMAGE_SIZE = 256
+IMAGE_SIZE = 384
 BATCH_SIZE = 8
 NUM_WORKERS = 4
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_SAVE_PATH = "patchcore_checkpoint.ckpt"
-# =========================================================
+
+MODEL_SAVE_PATH = "patchcore_memorybank.pth"
+# --------------------------------------------------------
 
 
-# =========================
-# 変換（前処理）
-# =========================
+# ============================
+# 前処理（transform）
+# ============================
 transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     transforms.ToTensor(),
 ])
 
-# =========================
-# データセット作成
-# =========================
+
+# ============================
+# Dataset & DataLoader
+# ============================
 train_dataset = datasets.ImageFolder(
     root=os.path.join(DATASET_ROOT, "train"),
     transform=transform
@@ -68,133 +58,121 @@ print("Train classes:", train_dataset.classes)
 print("Val   classes:", val_dataset.classes)
 print("Test  classes:", test_dataset.classes)
 
-# 【重要】フォルダ名とクラス名が合っているか確認
-assert NORMAL_CLASS_NAME in val_dataset.classes, f"{NORMAL_CLASS_NAME} が val にありません"
-assert ABNORMAL_CLASS_NAME in val_dataset.classes, f"{ABNORMAL_CLASS_NAME} が val にありません"
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                          num_workers=NUM_WORKERS)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                        num_workers=NUM_WORKERS)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                         num_workers=NUM_WORKERS)
 
-# torch.utils.data.DataLoader
-train_loader = DataLoader(
-    train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-    num_workers=NUM_WORKERS, pin_memory=True
-)
 
-val_loader = DataLoader(
-    val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-    num_workers=NUM_WORKERS, pin_memory=True
-)
+# ============================
+# PatchCore モデル本体
+# ============================
+from anomalib.models.image.patchcore import Patchcore
 
-test_loader = DataLoader(
-    test_dataset, batch_size=BATCH_SIZE, shuffle=False,
-    num_workers=NUM_WORKERS, pin_memory=True
-)
-
-# =========================
-# PatchCore モデルの用意
-# =========================
 model = Patchcore(
     backbone="resnet18",
-    pre_trained=True,
     layers=["layer2", "layer3"],
-    input_size=(IMAGE_SIZE, IMAGE_SIZE),
+    pre_trained=True
 ).to(DEVICE)
 
-engine = Engine(model=model, device=DEVICE)
 
-# =========================
-# 1. 学習（train: normal のみを使用）
-# =========================
-# PatchCore 的には "normal" しか学習しないのが前提なので、
-# train データは normal のみを入れておく運用にしておくのがベスト。
-print("=== Training PatchCore on train/normal ===")
-engine.fit(train_loader)
+# ============================
+# ★★★ PatchCore 学習：normal の特徴抽出 → メモリバンク作成 ★★★
+# ============================
 
-# モデル保存
+print("\n=== Extracting train(normal) features ===")
+
+train_features = []
+
+with torch.no_grad():
+    for imgs, labs in train_loader:
+        imgs = imgs.to(DEVICE)
+
+        # 特徴抽出
+        out = model(imgs)
+        feats = out["features"]       # ★ features を取る
+
+        train_features.append(feats.cpu())
+
+train_features = torch.cat(train_features, dim=0)
+print("Train features:", train_features.shape)
+
+# ★ メモリバンク構築（学習）
+print("\n=== Building memory bank ===")
+model.fit(train_features)
+
+# 保存
 torch.save(model.state_dict(), MODEL_SAVE_PATH)
-print(f"Saved model to {MODEL_SAVE_PATH}")
+print(f"Model saved: {MODEL_SAVE_PATH}")
 
 
-# =========================
-# ヘルパー：クラスID → 0/1（normal/abnormal）変換
-# =========================
-def make_class_to_binary_map(dataset):
-    """ImageFolder の class_to_idx から 0/1 ラベル用の dict を作る"""
-    c2i = dataset.class_to_idx
-    return {
-        c2i[NORMAL_CLASS_NAME]: 0,
-        c2i[ABNORMAL_CLASS_NAME]: 1,
+# ============================
+# ★★★ 推論関数：val/test 共通 ★★★
+# ============================
+def get_scores_and_labels(loader, dataset):
+    model.eval()
+    scores = []
+    labels = []
+
+    class_to_binary = {
+        dataset.class_to_idx[NORMAL_CLASS_NAME]: 0,
+        dataset.class_to_idx[ABNORMAL_CLASS_NAME]: 1,
     }
 
-
-def get_scores_and_labels(data_loader, dataset, model, device):
-    """指定の DataLoader から異常スコアと 0/1 ラベルを取得"""
-    model.eval()
-    all_scores = []
-    all_labels = []
-
-    class_to_binary = make_class_to_binary_map(dataset)
-
     with torch.no_grad():
-        for imgs, labels in data_loader:
-            imgs = imgs.to(device)
-            outputs = model(imgs)
+        for imgs, labs in loader:
+            imgs = imgs.to(DEVICE)
 
-            # anomalib の Patchcore は一般的に dict を返す想定
-            if isinstance(outputs, dict):
-                scores = outputs["anomaly_score"].detach().cpu().numpy()
-            else:
-                scores = outputs.detach().cpu().numpy()
+            out = model(imgs)
+            anom = out["anomaly_score"].cpu().numpy()
 
-            bin_labels = [class_to_binary[int(l)] for l in labels]
+            scores.extend(anom)
+            labels.extend([class_to_binary[int(l)] for l in labs])
 
-            all_scores.extend(scores)
-            all_labels.extend(bin_labels)
-
-    all_scores = np.array(all_scores).reshape(-1)
-    all_labels = np.array(all_labels).reshape(-1)
-    return all_scores, all_labels
+    return np.array(scores), np.array(labels)
 
 
-# =========================
-# 2. val で閾値を決定
-# =========================
-print("=== Inference on validation set (for threshold) ===")
-val_scores, val_labels = get_scores_and_labels(val_loader, val_dataset, model, DEVICE)
+# ============================
+# ★★★ val セットで最適閾値決定 ★★★
+# ============================
+print("\n=== Inference on val (threshold selection) ===")
 
-print("Val scores shape:", val_scores.shape)
-print("Val labels shape:", val_labels.shape)
+val_scores, val_labels = get_scores_and_labels(val_loader, val_dataset)
 
-fpr, tpr, thresholds = roc_curve(val_labels, val_scores)
-youden_j = tpr - fpr
-best_idx = np.argmax(youden_j)
-best_threshold = thresholds[best_idx]
+fpr, tpr, thr = roc_curve(val_labels, val_scores)
+youden = tpr - fpr
+best_idx = np.argmax(youden)
+best_threshold = thr[best_idx]
 
-print(f"Best threshold by Youden J on val: {best_threshold:.4f}")
+print(f"Best threshold = {best_threshold:.4f}")
 
 
-# =========================
-# 3. test で最終評価（混同行列）
-# =========================
-print("=== Inference on test set (final evaluation) ===")
-test_scores, test_labels = get_scores_and_labels(test_loader, test_dataset, model, DEVICE)
+# ============================
+# ★★★ test セット最終評価（混同行列） ★★★
+# ============================
+print("\n=== Inference on test ===")
+
+test_scores, test_labels = get_scores_and_labels(test_loader, test_dataset)
 
 pred_labels = (test_scores >= best_threshold).astype(int)
 
-cm = confusion_matrix(test_labels, pred_labels, labels=[0, 1])
-print("Confusion Matrix (rows=true, cols=pred):")
+cm = confusion_matrix(test_labels, pred_labels)
+print("\nConfusion Matrix:")
 print(cm)
 
-print("\nClassification report:")
+print("\nClassification Report:")
 print(classification_report(
     test_labels, pred_labels,
     target_names=["normal (safe)", "abnormal (danger)"]
 ))
 
-disp = ConfusionMatrixDisplay(
-    confusion_matrix=cm,
-    display_labels=["normal (safe)", "abnormal (danger)"]
-)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm,
+                              display_labels=["normal (safe)", "abnormal (danger)"])
 disp.plot()
-plt.title("Confusion Matrix - PatchCore (test set)")
+plt.title("PatchCore Confusion Matrix (test)")
 plt.tight_layout()
 plt.show()
+
 
