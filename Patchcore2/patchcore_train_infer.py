@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, confusion_matrix, ConfusionMatrixDisplay, classification_report
 
 # =================================================
-# ★ 設定：ここだけ自分の環境に合わせて変える
+# ★ 設定
 # =================================================
 DATASET_ROOT = "/home/yamamao/Patchcore/dataset"
 
@@ -19,7 +19,7 @@ BATCH_SIZE = 8
 NUM_WORKERS = 4
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_SAVE_PATH = "patchcore_memorybank.pth"
+MODEL_SAVE_PATH = "patchcore_oldmodel.pth"
 
 
 # =================================================
@@ -32,7 +32,7 @@ transform = transforms.Compose([
 
 
 # =================================================
-# データセット
+# データセット読み込み
 # =================================================
 train_dataset = datasets.ImageFolder(os.path.join(DATASET_ROOT, "train"), transform=transform)
 val_dataset = datasets.ImageFolder(os.path.join(DATASET_ROOT, "val"), transform=transform)
@@ -49,7 +49,7 @@ test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num
 
 
 # =================================================
-# PatchCore モデル
+# PatchCore（旧 anomalib 0.x 用）
 # =================================================
 from anomalib.models.image.patchcore import Patchcore
 
@@ -61,43 +61,19 @@ model = Patchcore(
 
 
 # =================================================
-# ★ 学習：feature_extractor を使う（forward 禁止）
+# ★ 学習（旧API：memory_bank を自動構築）
 # =================================================
-print("\n=== Extracting train(normal) features ===")
+print("\n=== Building memory bank from train(normal) ===")
 
-train_features = []
+# 旧版は buildメソッドが存在する
+model.build(train_loader)
 
-model.eval()
-
-with torch.no_grad():
-    for imgs, _ in train_loader:
-        imgs = imgs.to(DEVICE)
-
-        # ★ 正しい特徴抽出ルート
-        feat_dict = model.feature_extractor(imgs)
-        # feat_dict = {"layer2": Tensor[B,C,H,W], "layer3": Tensor[...]}
-
-        # 特徴マップを flatten して1ベクトルに
-        feat_vecs = []
-        for k in feat_dict:
-            f = feat_dict[k]
-            f = torch.flatten(f, 1)     # (B, C*H*W)
-            feat_vecs.append(f)
-
-        feats = torch.cat(feat_vecs, dim=1)   # (B, D)
-        train_features.append(feats.cpu())
-
-train_features = torch.cat(train_features, dim=0)
-print("Extracted train features:", train_features.shape)
-
-print("\n=== Building memory bank ===")
-model.fit(train_features)
 torch.save(model.state_dict(), MODEL_SAVE_PATH)
 print("Memory bank saved:", MODEL_SAVE_PATH)
 
 
 # =================================================
-# ★ 推論（predict API 使用）
+# ★ 推論関数（旧API：model(inputs)）
 # =================================================
 def get_scores_and_labels(loader, dataset):
     scores = []
@@ -113,11 +89,11 @@ def get_scores_and_labels(loader, dataset):
         for imgs, labs in loader:
             imgs = imgs.to(DEVICE)
 
-            # ★ PatchCore 推論の正規ルート
-            pred = model.predict(imgs)
+            # ★ 旧API：これで anomaly_score が返る
+            output = model(imgs)
 
-            # pred は Tensor（B,）として anomaly_score を返す
-            anomaly_scores = pred.cpu().numpy()
+            # output['anomaly_score'] が Tensor（B,）
+            anomaly_scores = output['anomaly_score'].cpu().numpy()
 
             scores.extend(anomaly_scores)
             labels.extend([class_to_bin[int(l)] for l in labs])
@@ -128,18 +104,17 @@ def get_scores_and_labels(loader, dataset):
 # =================================================
 # ★ 閾値（val）
 # =================================================
-print("\n=== Validation: threshold search ===")
+print("\n=== Validation ===")
 val_scores, val_labels = get_scores_and_labels(val_loader, val_dataset)
 
 fpr, tpr, thr = roc_curve(val_labels, val_scores)
 best_idx = np.argmax(tpr - fpr)
 best_threshold = thr[best_idx]
-
 print(f"Best threshold = {best_threshold:.4f}")
 
 
 # =================================================
-# ★ テスト評価
+# ★ test 評価
 # =================================================
 print("\n=== Test Evaluation ===")
 test_scores, test_labels = get_scores_and_labels(test_loader, test_dataset)
