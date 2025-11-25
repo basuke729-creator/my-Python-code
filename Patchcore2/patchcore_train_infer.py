@@ -20,6 +20,7 @@ NUM_WORKERS = 4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 MEMORY_BANK_PATH = "memory_bank.npy"
+CONF_MAT_PATH = "confusion_matrix.png"
 
 
 # ===============================
@@ -52,7 +53,7 @@ print("test:",  test_dataset.classes)
 # ===============================
 from torchvision.models import resnet18
 
-backbone = resnet18(pretrained=True)
+backbone = resnet18(weights="IMAGENET1K_V1")
 backbone.fc = nn.Identity()   # 最終層を無効化（特徴ベクトルだけ取得）
 backbone = backbone.to(DEVICE)
 backbone.eval()
@@ -82,20 +83,20 @@ memory_bank = extract_features(train_loader)
 print("Memory bank shape:", memory_bank.shape)
 
 np.save(MEMORY_BANK_PATH, memory_bank)
+print("Memory bank saved:", MEMORY_BANK_PATH)
 
 
 # ===============================
 # 距離計算（kNN距離）
 # ===============================
 def anomaly_score(features, bank):
-    # L2距離の最小値（各サンプルごと）
     dists = np.sqrt(((features[:, None, :] - bank[None, :, :]) ** 2).sum(axis=2))
     score = dists.min(axis=1)
     return score
 
 
 # ===============================
-# 推論関数（val / test 共通）
+# 推論関数
 # ===============================
 def get_scores_and_labels(loader, dataset):
     feats = extract_features(loader)
@@ -143,8 +144,16 @@ print(classification_report(
     target_names=["normal (safe)", "abnormal (danger)"]
 ))
 
+
+# ===============================
+# 混同行列の保存（PNG）
+# ===============================
 disp = ConfusionMatrixDisplay(cm, display_labels=["normal", "abnormal"])
 disp.plot()
 plt.title("PatchCore (ResNet18 kNN) Confusion Matrix")
 plt.tight_layout()
-plt.show()
+plt.savefig(CONF_MAT_PATH, dpi=300)
+plt.close()
+
+print(f"\nSaved confusion matrix as: {CONF_MAT_PATH}")
+
