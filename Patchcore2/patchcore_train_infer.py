@@ -75,18 +75,28 @@ class PatchCoreExtractor(nn.Module):
 # ================================
 def flatten_patches(feat_dict):
     """
-    feat_dict = {"layer2": (B,C,H,W), "layer3": (B,C,H,W)}
-    → return (B, H*W, C_all)
+    feat_dict = {"layer2": (B,C,H2,W2), "layer3": (B,C,H3,W3)}
+    → layer2 を layer3 のサイズにアップサンプリングして、チャンネル結合する
+    → (B, H3*W3, C_total)
     """
-    patches = []
-    for k, feat in feat_dict.items():
-        B, C, H, W = feat.shape
-        feat = feat.permute(0, 2, 3, 1)  # (B,H,W,C)
-        feat = feat.reshape(B, H * W, C)
-        patches.append(feat)
+    f2 = feat_dict["layer2"]
+    f3 = feat_dict["layer3"]
 
-    # (B, num_patches, total_channels)
-    return torch.cat(patches, dim=2)
+    B, C2, H2, W2 = f2.shape
+    B, C3, H3, W3 = f3.shape
+
+    # layer2 を layer3 の空間サイズにアップサンプル
+    f2_up = F.interpolate(f2, size=(H3, W3), mode="bilinear", align_corners=False)
+
+    # チャンネル方向で結合
+    feat = torch.cat([f2_up, f3], dim=1)  # (B, C2+C3, H3, W3)
+
+    # (B, H3*W3, C_total) に変換
+    feat = feat.permute(0, 2, 3, 1)    # (B, H3, W3, C_total)
+    feat = feat.reshape(B, H3 * W3, C2 + C3)
+
+    return feat
+
 
 
 # ================================
