@@ -1,275 +1,447 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # yolo2cls_pad_dirs.py
-# - 複数データセット (IMG_DIR:LABEL_DIR) 対応
-# - .names からクラス名読み込み
-# - クラスごとフォルダ分け出力
-# - 左右・上下で別倍率 (--scale-left/right/top/bottom)
-# - 画像端はクリップ
-# - パディング用の黒キャンバスは使わず、元画像からそのままcropしてリサイズ
+# YOLO ラベルから分類用クロップを作成
+# 現バージョン: 黒パディングは行わず、bbox 周辺＋背景を含めた「正方形」を切り出してリサイズ
 
-import argparse
+import argparse, sys, re, json
 from pathlib import Path
-import os
-from datetime import datetime
-
+from typing import List, Tuple, Optional, Set, Dict
 from PIL import Image
+from tqdm import tqdm
+import math
+import time
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
 def parse_args():
-    ap = argparse.ArgumentParser("YOLO -> Classification crops (dir, no black padding)")
-    # IMG_DIR:LABEL_DIR を複数指定可能
-    ap.add_argument(
-        "--dataset",
-        nargs="+",
-        required=True,
-        help="形式 'IMG_DIR:LABEL_DIR' をスペース区切りで複数指定可"
+    ap = argparse.ArgumentParser(
+        "YOLO -> classification crops (per-side scaling, square with context, robust logging)"
     )
     ap.add_argument(
-        "--names",
-        required=True,
-        help=".names ファイルのパス（クラス名を1行ずつ）"
+        "--dataset", action="append", required=True,
+        help="画像とYOLOラベルのペア 'IMAGES_DIR:LABELS_DIR'（複数可、--dataset を繰り返し）"
+    )
+    ap.add_argument("--out", required=True, help="出力ルート（クラスごとのサブフォルダを作成）")
+    ap.add_argument(
+        "--names", required=False,
+        help=".names ファイル（各行がクラス名）。省略時は 0..N-1 を逐次発見"
+    )
+    ap.add_argument("--scale-left", type=float, default=1.0, help="左方向倍率（例 1.25）")
+    ap.add_argument("--scale-right", type=float, default=1.25, help="右方向倍率")
+    ap.add_argument("--scale-top", type=float, default=1.0, help="上方向倍率")
+    ap.add_argument("--scale-bottom", type=float, default=1.25, help="下方向倍率")
+    ap.add_argument(
+        "--pad-bg", default="black",
+        help="※互換用。現在は背景込み正方形切り出しのため未使用"
+    )
+    ap.add_argument("--img-size", type=int, default=384, help="出力正方形サイズ（例: 384）")
+    ap.add_argument(
+        "--min-side", type=int, default=2,
+        help="切り出し後の最小幅/高さ(px)。未満はスキップ"
     )
     ap.add_argument(
-        "--out",
-        required=True,
-        help="出力ルートディレクトリ（クラスごとにサブフォルダ作成）"
+        "--max-per-image", type=int, default=9999,
+        help="1画像からの最大切り出し数"
     )
     ap.add_argument(
-        "--size",
-        type=int,
-        default=384,
-        help="出力画像の一辺のサイズ（正方形にリサイズ）"
+        "--only-classes", default="",
+        help="このクラスID/名のみ対象（カンマ区切り）例: '0,4,5' or '脚立1段目の人,脚立2段目の人'"
     )
-
-    # 拡大倍率（左右・上下で個別に）
+    ap.add_argument("--skip-classes", default="", help="このクラスID/名を除外")
     ap.add_argument(
-        "--scale-left", type=float, default=1.25,
-        help="左方向にどれだけ広げるかの倍率（1.0でそのまま）"
+        "--keep-empty-dirs", action="store_true",
+        help="画像が無くても全クラスの空フォルダを作成する"
     )
-    ap.add_argument(
-        "--scale-right", type=float, default=1.25,
-        help="右方向にどれだけ広げるかの倍率"
-    )
-    ap.add_argument(
-        "--scale-top", type=float, default=1.25,
-        help="上方向にどれだけ広げるかの倍率"
-    )
-    ap.add_argument(
-        "--scale-bottom", type=float, default=1.25,
-        help="下方向にどれだけ広げるかの倍率"
-    )
-
+    ap.add_argument("--log", default="", help="詳細ログ保存パス（指定すると原因が追える）")
     return ap.parse_args()
 
 
-def load_class_names(names_path: Path):
-    with open(names_path, "r", encoding="utf-8") as f:
-        lines = [l.strip() for l in f.readlines()]
-    # 空行を除外
-    return [l for l in lines if l != ""]
+def load_names(names_path: Optional[str]) -> Optional[List[str]]:
+    if not names_path:
+        return None
+    p = Path(names_path)
+    if not p.exists():
+        raise FileNotFoundError(f".names が見つかりません: {p}")
+    lines = [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return lines
 
 
-def yolo_to_pixel_box(
-    xc: float,
-    yc: float,
-    w: float,
-    h: float,
-    W: int,
-    H: int,
-    scale_left: float,
-    scale_right: float,
-    scale_top: float,
-    scale_bottom: float,
-):
-    """
-    YOLO 正規化 bbox (xc,yc,w,h in [0,1]) を元に、
-    左右・上下それぞれ別倍率で拡大した矩形を画像座標で返す。
+def safe_crop(img: Image.Image, box: Tuple[int, int, int, int]) -> Image.Image:
+    # PIL は box=(left, top, right, bottom) で右下は排他的。ここではすべてクリップ済み前提
+    return img.crop(box)
 
-    - まずピクセル単位の bbox (cx,cy,bw,bh) を計算
-    - 左右で半幅 * scale_left/right、上下で半高 * scale_top/bottom
-    - 画像端でクリップ（はみ出し部分は捨てる。黒で埋めない）
-    """
-    cx = xc * W
-    cy = yc * H
-    bw = w * W
-    bh = h * H
 
-    half_w = bw / 2.0
-    half_h = bh / 2.0
-
-    left   = cx - half_w * scale_left
-    right  = cx + half_w * scale_right
-    top    = cy - half_h * scale_top
-    bottom = cy + half_h * scale_bottom
-
-    # クリップ
-    left   = max(0.0, min(W - 1.0, left))
-    right  = max(1.0, min(W * 1.0, right))
-    top    = max(0.0, min(H - 1.0, top))
-    bottom = max(1.0, min(H * 1.0, bottom))
-
-    if right <= left or bottom <= top:
+def parse_line(line: str) -> Optional[Tuple[int, float, float, float, float]]:
+    # YOLO: <class> <cx> <cy> <w> <h>  （正規化）
+    parts = line.strip().split()
+    if len(parts) < 5:
+        return None
+    try:
+        cls = int(float(parts[0]))
+        cx, cy, w, h = map(float, parts[1:5])
+        return cls, cx, cy, w, h
+    except Exception:
         return None
 
-    return int(round(left)), int(round(top)), int(round(right)), int(round(bottom))
+
+def yolo_to_xyxy(cx, cy, w, h, W, H):
+    # 正規化→絶対座標
+    x = (cx - w / 2) * W
+    y = (cy - h / 2) * H
+    x2 = (cx + w / 2) * W
+    y2 = (cy + h / 2) * H
+    return x, y, x2, y2
 
 
-def process_one_image(
-    img_path: Path,
-    label_path: Path,
-    out_root: Path,
-    class_names,
-    out_size: int,
-    scale_left: float,
-    scale_right: float,
-    scale_top: float,
-    scale_bottom: float,
-    log_f,
-):
-    try:
-        img = Image.open(img_path).convert("RGB")
-    except Exception as e:
-        log_f.write(f"[WARN] open failed: {img_path} ({e})\n")
-        return 0
+def scale_box_sides(x1, y1, x2, y2, W, H, sL, sR, sT, sB):
+    # 各辺を独立に拡大。中心を固定せず “辺を外側へ” 拡げるイメージ
+    w = max(1e-6, x2 - x1)
+    h = max(1e-6, y2 - y1)
+    # 増分
+    dxL = (sL - 1.0) * w
+    dxR = (sR - 1.0) * w
+    dyT = (sT - 1.0) * h
+    dyB = (sB - 1.0) * h
+    x1_ = x1 - dxL
+    x2_ = x2 + dxR
+    y1_ = y1 - dyT
+    y2_ = y2 + dyB
+    # 画面端でクリップ
+    x1_ = max(0.0, x1_)
+    y1_ = max(0.0, y1_)
+    x2_ = min(float(W), x2_)
+    y2_ = min(float(H), y2_)
+    # 最低1px確保（丸め時ゼロにならないよう）
+    if x2_ - x1_ < 1.0:
+        midx = (x1_ + x2_) / 2.0
+        x1_ = max(0.0, midx - 0.5)
+        x2_ = min(float(W), midx + 0.5)
+    if y2_ - y1_ < 1.0:
+        midy = (y1_ + y2_) / 2.0
+        y1_ = max(0.0, midy - 0.5)
+        y2_ = min(float(H), midy + 0.5)
+    return x1_, y1_, x2_, y2_
 
-    W, H = img.size
 
-    try:
-        with open(label_path, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f.readlines() if l.strip()]
-    except FileNotFoundError:
-        # ラベルがない画像はスキップ
-        return 0
+def round_box(x1, y1, x2, y2):
+    # PIL の crop は int が基本。off-by-one で 0px にならないよう ceil/floor を工夫
+    left = int(math.floor(x1))
+    top = int(math.floor(y1))
+    right = int(math.ceil(x2))
+    bottom = int(math.ceil(y2))
+    # 念のため right>left, bottom>top を保証
+    if right <= left:
+        right = left + 1
+    if bottom <= top:
+        bottom = top + 1
+    return left, top, right, bottom
 
-    base_name = img_path.stem
-    saved = 0
 
-    for idx, line in enumerate(lines):
-        parts = line.split()
-        if len(parts) != 5:
-            log_f.write(f"[WARN] bad line in {label_path}: '{line}'\n")
-            continue
+def make_square_box_with_context(
+    left: int, top: int, right: int, bottom: int,
+    W: int, H: int
+) -> Tuple[int, int, int, int]:
+    """
+    拡大後の矩形(left,top,right,bottom)を中心に、
+    元画像内で可能な限り背景も含めた「正方形」領域に広げる。
+    """
+    w = right - left
+    h = bottom - top
+    if w <= 0 or h <= 0:
+        return left, top, right, bottom
 
-        try:
-            cls_id = int(parts[0])
-            xc, yc, w, h = map(float, parts[1:5])
-        except Exception:
-            log_f.write(f"[WARN] parse error in {label_path}: '{line}'\n")
-            continue
+    # 正方形の一辺（元矩形を必ず含む）
+    side = max(w, h)
+    side = min(side, W, H)  # 画像サイズを超えないように
 
-        if cls_id < 0 or cls_id >= len(class_names):
-            log_f.write(f"[WARN] invalid class id {cls_id} in {label_path}\n")
-            continue
+    cx = (left + right) / 2.0
+    cy = (top + bottom) / 2.0
 
-        box = yolo_to_pixel_box(
-            xc, yc, w, h,
-            W, H,
-            scale_left, scale_right,
-            scale_top, scale_bottom
-        )
-        if box is None:
-            log_f.write(f"[WARN] zero-size box in {img_path} line='{line}'\n")
-            continue
+    x1 = cx - side / 2.0
+    y1 = cy - side / 2.0
+    x2 = x1 + side
+    y2 = y1 + side
 
-        x1, y1, x2, y2 = box
-        # 元画像から背景ごと crop
-        crop = img.crop((x1, y1, x2, y2))
-        # そのまま正方形にリサイズ（歪みは出るが黒ベタは作らない）
-        crop = crop.resize((out_size, out_size), Image.BICUBIC)
+    # 画像内に収まるよう平行移動
+    if x1 < 0:
+        x2 -= x1
+        x1 = 0
+    if x2 > W:
+        diff = x2 - W
+        x1 -= diff
+        x2 = W
+        if x1 < 0:
+            x1 = 0
 
-        cls_name = class_names[cls_id]
-        out_dir = out_root / cls_name
-        out_dir.mkdir(parents=True, exist_ok=True)
+    if y1 < 0:
+        y2 -= y1
+        y1 = 0
+    if y2 > H:
+        diff = y2 - H
+        y1 -= diff
+        y2 = H
+        if y1 < 0:
+            y1 = 0
 
-        out_path = out_dir / f"{base_name}_{idx}.jpg"
-        # 同名衝突を避ける（ほぼ無いと思うが念のため）
-        k = 1
-        while out_path.exists():
-            out_path = out_dir / f"{base_name}_{idx}_{k}.jpg"
-            k += 1
+    # int に丸めて、正方形を維持
+    left_i = int(math.floor(x1))
+    top_i = int(math.floor(y1))
+    right_i = int(math.ceil(x2))
+    bottom_i = int(math.ceil(y2))
 
-        try:
-            crop.save(out_path, quality=95)
-            saved += 1
-        except Exception as e:
-            log_f.write(f"[WARN] save failed {out_path}: {e}\n")
+    if right_i <= left_i:
+        right_i = left_i + 1
+    if bottom_i <= top_i:
+        bottom_i = top_i + 1
 
-    return saved
+    # 丸めのせいで縦横がズレたら、長い方に合わせて伸ばす
+    w2 = right_i - left_i
+    h2 = bottom_i - top_i
+    if w2 < h2:
+        need = h2 - w2
+        right_i = min(W, right_i + need)
+    elif h2 < w2:
+        need = w2 - h2
+        bottom_i = min(H, bottom_i + need)
+
+    return left_i, top_i, right_i, bottom_i
+
+
+def ensure_dirs(root: Path, class_names: List[str], keep_empty: bool):
+    root.mkdir(parents=True, exist_ok=True)
+    if keep_empty:
+        for cname in class_names:
+            (root / cname).mkdir(parents=True, exist_ok=True)
+
+
+def class_filter_sets(only: str, skip: str, class_names: List[str]) -> Tuple[Set[str], Set[str]]:
+    # 入力はID/名が混在可。名を優先し、IDは class_names に解決する
+    def parse_list(s):
+        return [x.strip() for x in s.split(",") if x.strip()]
+
+    only_set: Set[str] = set()
+    skip_set: Set[str] = set()
+    for token in parse_list(only):
+        if token.isdigit() and int(token) < len(class_names):
+            only_set.add(class_names[int(token)])
+        else:
+            only_set.add(token)
+    for token in parse_list(skip):
+        if token.isdigit() and int(token) < len(class_names):
+            skip_set.add(class_names[int(token)])
+        else:
+            skip_set.add(token)
+    return only_set, skip_set
 
 
 def main():
     args = parse_args()
-
     out_root = Path(args.out)
-    out_root.mkdir(parents=True, exist_ok=True)
+    log_path = Path(args.log) if args.log else None
+    logger = open(log_path, "w", encoding="utf-8") if log_path else None
 
-    class_names = load_class_names(Path(args.names))
-    print(f"[INFO] class names: {class_names}")
+    def log(msg):
+        if logger:
+            logger.write(msg.rstrip() + "\n")
 
-    # ログファイル
-    log_path = out_root / "_convert.log"
-    with open(log_path, "a", encoding="utf-8") as log_f:
-        log_f.write(f"\n=== run at {datetime.now().isoformat()} ===\n")
-        log_f.write(f"datasets   : {args.dataset}\n")
-        log_f.write(f"names      : {args.names}\n")
-        log_f.write(f"size       : {args.size}\n")
-        log_f.write(
-            f"scale L/R/T/B = {args.scale_left}, {args.scale_right}, "
-            f"{args.scale_top}, {args.scale_bottom}\n"
-        )
+    try:
+        # クラス名
+        names = load_names(args.names)
+        discovered_max_cls = -1
 
-        total_saved = 0
-        total_imgs = 0
-
+        datasets: List[Tuple[Path, Path]] = []
         for pair in args.dataset:
-            # "IMG_DIR:LABEL_DIR"
             if ":" not in pair:
-                log_f.write(f"[WARN] bad --dataset entry: '{pair}' (skip)\n")
-                continue
-            img_dir_str, label_dir_str = pair.split(":", 1)
-            img_dir = Path(img_dir_str)
-            label_dir = Path(label_dir_str)
+                raise ValueError(f"--dataset は 'IMAGES_DIR:LABELS_DIR' 形式です: {pair}")
+            im_dir, lb_dir = pair.split(":", 1)
+            datasets.append((Path(im_dir), Path(lb_dir)))
 
-            if not img_dir.is_dir():
-                log_f.write(f"[WARN] img_dir not found: {img_dir}\n")
-                continue
-            if not label_dir.is_dir():
-                log_f.write(f"[WARN] label_dir not found: {label_dir}\n")
-                continue
-
-            log_f.write(f"[INFO] process dataset IMG={img_dir} LABEL={label_dir}\n")
-
-            img_files = sorted(
-                p for p in img_dir.rglob("*")
-                if p.suffix.lower() in VALID_EXTS and p.is_file()
-            )
-            log_f.write(f"[INFO] images found: {len(img_files)}\n")
-
-            for img_path in img_files:
-                label_path = label_dir / (img_path.stem + ".txt")
-                if not label_path.exists():
-                    # ラベルがない画像はスキップ
+        # 画像・ラベルのインデックス作成
+        items: List[Tuple[Path, Path]] = []
+        for img_dir, lb_dir in datasets:
+            if not img_dir.exists() or not lb_dir.exists():
+                raise FileNotFoundError(f"パス確認: images={img_dir} labels={lb_dir}")
+            # ラベル側を基準に、対応する画像を探す（拡張子違いに対応）
+            for lb in lb_dir.rglob("*.txt"):
+                stem = lb.stem
+                found_img = None
+                for ext in VALID_EXTS:
+                    cand = img_dir / f"{stem}{ext}"
+                    if cand.exists():
+                        found_img = cand
+                        break
+                if not found_img:
+                    # サブフォルダ構成が違う時も試す（labels と images が同じ相対構造の場合）
+                    # 例: labels/a/b/xxx.txt -> images/a/b/xxx.jpg
+                    rel = lb.relative_to(lb_dir).with_suffix("")
+                    for ext in VALID_EXTS:
+                        cand = img_dir / rel.with_suffix(ext)
+                        if cand.exists():
+                            found_img = cand
+                            break
+                if not found_img:
+                    log(f"[MISS_IMG] 対応画像なし: {lb}")
                     continue
-                saved = process_one_image(
-                    img_path,
-                    label_path,
-                    out_root,
-                    class_names,
-                    out_size=args.size,
-                    scale_left=args.scale_left,
-                    scale_right=args.scale_right,
-                    scale_top=args.scale_top,
-                    scale_bottom=args.scale_bottom,
-                    log_f=log_f,
+                items.append((found_img, lb))
+
+        if not items:
+            print("処理対象が見つかりませんでした。--dataset の指定を確認してください。")
+            return
+
+        # 一旦、全ラベルを走査して最大クラスIDを確認（.names 省略時の上限用）
+        if names is None:
+            for _, lb in items:
+                try:
+                    for ln in lb.read_text(encoding="utf-8").splitlines():
+                        parsed = parse_line(ln)
+                        if not parsed:
+                            continue
+                        cls, cx, cy, w, h = parsed
+                        discovered_max_cls = max(discovered_max_cls, cls)
+                except Exception as e:
+                    log(f"[READ_ERR] {lb} {e}")
+            if discovered_max_cls >= 0:
+                names = [str(i) for i in range(discovered_max_cls + 1)]
+            else:
+                print("有効なラベルが見つかりませんでした。")
+                return
+
+        class_names: List[str] = names
+        class_count: Dict[str, int] = {c: 0 for c in class_names}
+        ensure_dirs(out_root, class_names, keep_empty=args.keep_empty_dirs)
+
+        only_set, skip_set = class_filter_sets(args.only_classes, args.skip_classes, class_names)
+
+        total_boxes = 0
+        saved_boxes = 0
+
+        for img_path, lb_path in tqdm(items, desc="Cropping"):
+            try:
+                img = Image.open(img_path).convert("RGB")
+            except Exception as e:
+                log(f"[OPEN_ERR] {img_path} {e}")
+                continue
+
+            W, H = img.size
+            try:
+                lines = lb_path.read_text(encoding="utf-8").splitlines()
+            except Exception as e:
+                log(f"[READ_ERR] {lb_path} {e}")
+                continue
+
+            out_count = 0
+            box_idx = 0
+            for ln in lines:
+                parsed = parse_line(ln)
+                if not parsed:
+                    if ln.strip():
+                        log(f"[BAD_LINE] {lb_path} :: '{ln}'")
+                    continue
+                cls_id, cx, cy, w, h = parsed
+                total_boxes += 1
+
+                if not (0 <= cls_id < len(class_names)):
+                    log(f"[CLS_OOB] {lb_path} クラスID={cls_id} 範囲外(0..{len(class_names) - 1})")
+                    continue
+
+                cls_name = class_names[cls_id]
+                if only_set and cls_name not in only_set:
+                    box_idx += 1
+                    continue
+                if skip_set and cls_name in skip_set:
+                    box_idx += 1
+                    continue
+
+                # 正規化 → 座標
+                x1, y1, x2, y2 = yolo_to_xyxy(cx, cy, w, h, W, H)
+
+                # 各辺倍率で拡大＋画面端クリップ＋最小1px保証
+                x1s, y1s, x2s, y2s = scale_box_sides(
+                    x1, y1, x2, y2, W, H,
+                    args.scale_left, args.scale_right, args.scale_top, args.scale_bottom
                 )
-                total_saved += saved
-                total_imgs += 1
+                left, top, right, bottom = round_box(x1s, y1s, x2s, y2s)
 
-        log_f.write(f"[INFO] processed images: {total_imgs}, crops saved: {total_saved}\n")
+                # ★ 背景込みの「正方形」領域に広げる
+                left, top, right, bottom = make_square_box_with_context(left, top, right, bottom, W, H)
 
-    print(f"[DONE] crops saved: {total_saved}  (log: {log_path})")
+                bw, bh = right - left, bottom - top
+                if bw < args.min_side or bh < args.min_side:
+                    log(f"[TOO_SMALL] {img_path} box#{box_idx} -> {bw}x{bh}px (min {args.min_side})")
+                    box_idx += 1
+                    continue
+
+                # クロップ
+                try:
+                    crop = safe_crop(img, (left, top, right, bottom))
+                except Exception as e:
+                    log(f"[CROP_ERR] {img_path} box#{box_idx} {e}")
+                    box_idx += 1
+                    continue
+
+                # 正方形パッチを img_size×img_size にリサイズ（黒パディングなし）
+                out_img = crop.resize((args.img_size, args.img_size), Image.BICUBIC)
+
+                # 保存先
+                cls_dir = out_root / cls_name
+                cls_dir.mkdir(parents=True, exist_ok=True)
+
+                stem = img_path.stem
+                out_name = f"{stem}_b{box_idx}.jpg"
+                dst = cls_dir / out_name
+                k = 1
+                while dst.exists():
+                    dst = cls_dir / f"{stem}_b{box_idx}_{k}.jpg"
+                    k += 1
+
+                try:
+                    out_img.save(dst, quality=95)
+                except Exception as e:
+                    log(f"[SAVE_ERR] {dst} {e}")
+                    box_idx += 1
+                    continue
+
+                class_count[cls_name] += 1
+                saved_boxes += 1
+                out_count += 1
+                box_idx += 1
+
+                if out_count >= args.max_per_image:
+                    log(f"[MAX_PER_IMAGE] {img_path} reached {args.max_per_image}")
+                    break
+
+            if out_count == 0:
+                log(f"[NO_CROP] {img_path} 画像から切り出し0件（ラベル無効/フィルタ/極小/範囲外の可能性）")
+
+        # 要約
+        summary = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "out": str(out_root),
+            "total_label_boxes": total_boxes,
+            "saved_crops": saved_boxes,
+            "per_class_counts": class_count,
+            "scales": {
+                "left": args.scale_left, "right": args.scale_right,
+                "top": args.scale_top, "bottom": args.scale_bottom
+            },
+            "img_size": args.img_size,
+            "min_side": args.min_side,
+            "pad_bg": args.pad_bg,  # 互換用メタ情報
+        }
+        (out_root / "_summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        if logger:
+            logger.write(json.dumps(summary, ensure_ascii=False) + "\n")
+
+        print("Done.")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    finally:
+        if logger:
+            logger.close()
 
 
 if __name__ == "__main__":
