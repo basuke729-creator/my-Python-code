@@ -12,6 +12,7 @@ from sklearn.metrics import (
     classification_report,
     f1_score,
     accuracy_score,
+    roc_curve,           # ★ 追加
 )
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -31,8 +32,8 @@ NUM_WORKERS = 4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # coreset は使わない（精度優先＆高速化）
-USE_CORESET = False       # True にすると Greedy coreset を使えるが激遅
-CORESET_RATIO = 0.01      # coreset を使う場合の割合
+USE_CORESET = False
+CORESET_RATIO = 0.01
 
 CONF_MAT_PATH = "confusion_matrix_norm.png"
 CSV_PATH = "predictions.csv"
@@ -40,9 +41,7 @@ CSV_PATH = "predictions.csv"
 # 画像保存用ディレクトリ
 RESULTS_PRED_DIR = "results_pred"      # 予測ラベルごと（元画像）
 RESULTS_SPLIT_DIR = "results_split"    # TP/TN/FP/FN ごと（元画像）
-
-# ヒートマップを「予測 normal / abnormal」で保存
-HEATMAP_PRED_DIR = "heatmaps_pred"     # heatmaps_pred/normal, heatmaps_pred/abnormal
+HEATMAP_PRED_DIR = "heatmaps_pred"     # 予測ラベルごとのヒートマップ
 
 # ================================
 #  再現性用のシード
@@ -265,30 +264,33 @@ def infer_scores_labels_and_paths(loader, dataset, model, memory_bank_t):
     return np.array(scores), np.array(labels), paths
 
 # ================================
-#  Val 上で F1 が最大となるしきい値を探す
+#  しきい値決定：Youden index（tpr - fpr 最大）
+#   → normal/abnormal をバランスよく分けたいとき向き
 # ================================
-def choose_best_threshold(val_scores, val_labels, metric="f1"):
-    thresholds = np.unique(val_scores)
-    best_thr = thresholds[0]
-    best_score = -1.0
-
-    for thr in thresholds:
-        pred = (val_scores >= thr).astype(int)
-        if metric == "f1":
-            m = f1_score(val_labels, pred)
-        elif metric == "acc":
-            m = accuracy_score(val_labels, pred)
-        else:
-            m = f1_score(val_labels, pred)
-
-        if m > best_score:
-            best_score = m
-            best_thr = thr
-
-    return best_thr, best_score
+def choose_best_threshold(val_scores, val_labels, mode="youden"):
+    if mode == "youden":
+        fpr, tpr, thr = roc_curve(val_labels, val_scores)
+        youden = tpr - fpr
+        best_idx = np.argmax(youden)
+        return thr[best_idx]
+    else:
+        # 参考：F1 や accuracy 最大を使いたい場合はこちら
+        thresholds = np.unique(val_scores)
+        best_thr = thresholds[0]
+        best_score = -1.0
+        for thr in thresholds:
+            pred = (val_scores >= thr).astype(int)
+            if mode == "f1":
+                m = f1_score(val_labels, pred)
+            else:  # "acc"
+                m = accuracy_score(val_labels, pred)
+            if m > best_score:
+                best_score = m
+                best_thr = thr
+        return best_thr
 
 # ================================
-#  ★ここが 3 パネル版ヒートマップ★
+#  3 パネル版ヒートマップ
 # ================================
 def save_anomaly_heatmap(img_tensor, anomaly_map, out_path, mask_thr=0.7):
     """
@@ -336,7 +338,6 @@ def save_anomaly_heatmap(img_tensor, anomaly_map, out_path, mask_thr=0.7):
 
     # 右：元画像 + Pred Mask（輪郭）
     axes[2].imshow(img_np)
-    # しきい値 mask_thr で等高線を描く
     axes[2].contour(
         amap_up,
         levels=[mask_thr],
@@ -457,16 +458,18 @@ def main():
 
     memory_bank_t = torch.from_numpy(memory_np).to(DEVICE)
 
-    # 2) Validation でベストしきい値（F1最大）を決定
+    # 2) Validation でしきい値決定（Youden index）
     print("\n=== Validation ===")
     val_scores, val_labels = infer_scores(val_loader, val_ds, model, memory_bank_t)
-    threshold, best_f1 = choose_best_threshold(val_scores, val_labels, metric="f1")
-    print(f"Best threshold (by F1) = {threshold:.6f}")
-    print(f"Best F1 on val = {best_f1:.4f}")
+    threshold = choose_best_threshold(val_scores, val_labels, mode="youden")
+    print(f"Best threshold (Youden index) = {threshold:.6f}")
 
+    # 参考として F1 / accuracy も表示
     val_pred = (val_scores >= threshold).astype(int)
+    val_f1 = f1_score(val_labels, val_pred)
     val_acc = accuracy_score(val_labels, val_pred)
-    print(f"Val accuracy at best F1 threshold = {val_acc:.4f}")
+    print(f"Val F1 at this threshold = {val_f1:.4f}")
+    print(f"Val accuracy           = {val_acc:.4f}")
 
     # 3) Test 評価
     print("\n=== Test ===")
@@ -540,4 +543,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
