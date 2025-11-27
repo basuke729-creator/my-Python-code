@@ -12,7 +12,6 @@ from sklearn.metrics import (
     classification_report,
     f1_score,
     accuracy_score,
-    roc_curve,           # ★ 追加
 )
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -33,7 +32,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # coreset は使わない（精度優先＆高速化）
 USE_CORESET = False
-CORESET_RATIO = 0.01
+CORESET_RATIO = 0.01  # USE_CORESET=True にしたときだけ使用
 
 CONF_MAT_PATH = "confusion_matrix_norm.png"
 CSV_PATH = "predictions.csv"
@@ -264,30 +263,36 @@ def infer_scores_labels_and_paths(loader, dataset, model, memory_bank_t):
     return np.array(scores), np.array(labels), paths
 
 # ================================
-#  しきい値決定：Youden index（tpr - fpr 最大）
-#   → normal/abnormal をバランスよく分けたいとき向き
+#  しきい値決定：min(TPR, TNR) を最大化
+#   → normal / abnormal のバランス重視
 # ================================
-def choose_best_threshold(val_scores, val_labels, mode="youden"):
-    if mode == "youden":
-        fpr, tpr, thr = roc_curve(val_labels, val_scores)
-        youden = tpr - fpr
-        best_idx = np.argmax(youden)
-        return thr[best_idx]
-    else:
-        # 参考：F1 や accuracy 最大を使いたい場合はこちら
-        thresholds = np.unique(val_scores)
-        best_thr = thresholds[0]
-        best_score = -1.0
-        for thr in thresholds:
-            pred = (val_scores >= thr).astype(int)
-            if mode == "f1":
-                m = f1_score(val_labels, pred)
-            else:  # "acc"
-                m = accuracy_score(val_labels, pred)
-            if m > best_score:
-                best_score = m
-                best_thr = thr
-        return best_thr
+def choose_best_threshold(val_scores, val_labels):
+    """
+    しきい値ごとに TPR(abnormal) と TNR(normal) を計算し、
+    min(TPR, TNR) が最大になるようなしきい値を選ぶ。
+    """
+    thresholds = np.unique(val_scores)
+    best_thr = thresholds[0]
+    best_min_recall = -1.0
+
+    for thr in thresholds:
+        pred = (val_scores >= thr).astype(int)
+
+        cm = confusion_matrix(val_labels, pred, labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
+
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0   # abnormal の再現率
+        tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0   # normal の再現率
+
+        min_recall = min(tpr, tnr)  # 両クラスのうち低い方
+
+        if min_recall > best_min_recall:
+            best_min_recall = min_recall
+            best_thr = thr
+
+    print(f"Selected threshold to maximize min(TPR, TNR): {best_thr:.6f}")
+    print(f"Best min recall (min(TPR,TNR)) on val: {best_min_recall:.4f}")
+    return best_thr
 
 # ================================
 #  3 パネル版ヒートマップ
@@ -458,18 +463,18 @@ def main():
 
     memory_bank_t = torch.from_numpy(memory_np).to(DEVICE)
 
-    # 2) Validation でしきい値決定（Youden index）
+    # 2) Validation でしきい値決定（min(TPR,TNR) 最大）
     print("\n=== Validation ===")
     val_scores, val_labels = infer_scores(val_loader, val_ds, model, memory_bank_t)
-    threshold = choose_best_threshold(val_scores, val_labels, mode="youden")
-    print(f"Best threshold (Youden index) = {threshold:.6f}")
+    threshold = choose_best_threshold(val_scores, val_labels)
 
     # 参考として F1 / accuracy も表示
     val_pred = (val_scores >= threshold).astype(int)
     val_f1 = f1_score(val_labels, val_pred)
     val_acc = accuracy_score(val_labels, val_pred)
-    print(f"Val F1 at this threshold = {val_f1:.4f}")
-    print(f"Val accuracy           = {val_acc:.4f}")
+    print(f"Val threshold = {threshold:.6f}")
+    print(f"Val F1        = {val_f1:.4f}")
+    print(f"Val accuracy  = {val_acc:.4f}")
 
     # 3) Test 評価
     print("\n=== Test ===")
@@ -543,5 +548,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
