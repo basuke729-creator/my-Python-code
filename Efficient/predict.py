@@ -323,5 +323,8 @@ if __name__ == "__main__":
     Path(args.out).mkdir(parents=True, exist_ok=True)
     train(args)
 
+if __name__ == "main":
+    args = parse_args()
+    
 
 

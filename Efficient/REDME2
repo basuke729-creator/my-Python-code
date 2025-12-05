@@ -134,21 +134,26 @@ PY
 python train_effnetv2.py \
   --data "./cls_dataset" \
   --out "./runs/exp_shiftresize_focal_freeze4" \
-  --model tf_efficientnetv2_s \
+  --model tf_efficientnetv2_m \
   --img-size 384 \
   --batch-size 32 \
-  --epochs 50 \
-  --lr 1e-4 \
-  --min-lr 1e-6 \
-  --wd 1e-4 \
+  --epochs 300 \
+  --head-ls-mult 10 \
+  --lr-schedule cosine_wr \
+  --To 5 \
+  --T-mult 2 \
+  --min-lr le-6 \
   --warmup-epochs 3 \
-  --lr-schedule cosine_wr --T0 5 --T-mult 2 \
-  --aug light \
-  --amp \
-  --tensorboard \
-  --freeze-upto 4 \
-  --focal-loss --focal-gamma 2.0 \
-  --weighted-loss
+  --wd le-4 \
+  --weighted-loss \
+  --label-smoothing 0.1 \
+  --tensorbord
+
+python export_effnetv2_onnx.py \
+  --ckpt ./runs/exp_shiftresize_focal_freeze4/best.ckpt \
+  --model tf_efficientnetv2_m \
+  --img-size 384 \
+  --out ./runs/exp_shiftresize_focal_freeze4/effnetv2_m_best_op18.onnx
 
 
 
