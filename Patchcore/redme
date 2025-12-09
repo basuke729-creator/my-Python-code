@@ -47,3 +47,21 @@ python build_results_and_confmat.py \
   --return_predictions true
 
   python -c "import anomalib, lightning; print('anomalib', anomalib.__version__); print('lightning', lightning.__version__)"
+
+  sel_idxs = []
+for i in range(len(masks_gt)):
+    if np.sum(masks_gt[i]) > 0:
+        sel_idxs.append(i)
+
+if len(sel_idxs) > 0:
+    pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(
+        [segmentations[i] for i in sel_idxs],
+        [masks_gt[i] for i in sel_idxs],
+    )
+    anomaly_pixel_auroc = pixel_scores["auroc"]
+else:
+    LOGGER.warning(
+        "No non-empty ground-truth masks found; "
+        "skipping anomaly-only pixel-wise metrics."
+    )
+    anomaly_pixel_auroc = float("nan")
