@@ -37,3 +37,94 @@ python bin/run_patchcore.py \
       --imagesize 224 \
       -d safe_pose \
       custom $datapath
+
+def plot_confusion_matrix_from_scores(
+    scores,
+    labels,
+    threshold,
+    save_path,
+    class_names=("normal", "abnormal"),
+):
+    """
+    scores:  画像ごとの異常スコア (numpy 1D)
+    labels:  正解ラベル (0=normal, 1=abnormal の numpy 1D)
+    threshold: scores >= threshold を abnormal と判定
+    save_path: PNG を保存するパス
+    """
+
+    scores = np.asarray(scores)
+    labels = np.asarray(labels).astype(int)
+
+    # 予測ラベル (0: normal, 1: abnormal)
+    preds = (scores >= threshold).astype(int)
+
+    # 混同行列 (行: True, 列: Pred)
+    tn = np.sum((labels == 0) & (preds == 0))  # normal→normal
+    fp = np.sum((labels == 0) & (preds == 1))  # normal→abnormal
+    fn = np.sum((labels == 1) & (preds == 0))  # abnormal→normal
+    tp = np.sum((labels == 1) & (preds == 1))  # abnormal→abnormal
+
+    cm = np.array([[tn, fp],
+                   [fn, tp]], dtype=float)
+
+    # 行方向に正規化して％表示
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_norm = np.divide(
+        cm,
+        row_sums,
+        out=np.zeros_like(cm),
+        where=row_sums != 0
+    ) * 100.0
+
+    fig, ax = plt.subplots()
+    im = ax.imshow(cm_norm, vmin=0, vmax=100)
+
+    # 軸ラベル
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(class_names)
+    ax.set_yticklabels(class_names)
+    ax.set_xlabel("Predicted label")
+    ax.set_ylabel("True label")
+    ax.set_title("PatchCore Confusion Matrix (row-normalized %)")
+
+    # 各マスに数値を書き込む
+    for i in range(2):
+        for j in range(2):
+            ax.text(
+                j,
+                i,
+                f"{cm_norm[i, j]:.1f}",
+                ha="center",
+                va="center",
+            )
+
+    cbar = fig.colorbar(im)
+    cbar.set_label("Percentage (%)")
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+    # 画像レベルの最適閾値（F1 最大など）を取得
+    optimal_threshold = image_metrics.get("optimal_threshold", None)
+    if optimal_threshold is None:
+        # もし辞書に入っていない場合は、簡易的に中央値を閾値にする
+        optimal_threshold = float(np.median(image_scores))
+
+    # 結果保存ディレクトリを決める（既存の変数名に合わせてください）
+    # 例: run_patchcore.py 内で Results を保存しているフォルダ変数が
+    # "results_path" や "save_path" などあるはずなので、それを使います。
+    # ここでは例として "results_path" を使用：
+    cm_save_path = os.path.join(
+        results_path,
+        f"confusion_matrix_{dataset_name}.png"
+    )
+
+    plot_confusion_matrix_from_scores(
+        scores=image_scores,
+        labels=image_labels,
+        threshold=optimal_threshold,
+        save_path=cm_save_path,
+        class_names=("normal", "abnormal"),
+    )
