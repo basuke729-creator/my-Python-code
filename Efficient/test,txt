@@ -12,3 +12,32 @@ python evaluate_predictions.py \
   --preds-csv "runs/preds.csv" \
   --output-dir "runs/eval_report" \
   --export-miscls
+  
+# 1) Pythonパスを通す（毎回必要）
+export PYTHONPATH=src
+
+# 2) データセットのルート（safe_pose の1つ上）
+datapath=../datasets/pose_dataset
+
+# 3) 学習（メモリバンク構築）
+python bin/run_patchcore.py \
+  --gpu 0 \
+  --seed 0 \
+  --save_patchcore_model \
+  --log_group safe_pose_train \
+  --log_project pose_results \
+  patch_core \
+      -b wideresnet50 \
+      -le layer2 -le layer3 \
+      --faiss_on_gpu \
+      --pretrain_embed_dimension 1024 \
+      --target_embed_dimension 1024 \
+      --anomaly_scorer_num_nn 1 \
+      --patchsize 3 \
+  sampler \
+      -p 0.1 approx_greedy_coreset \
+  dataset \
+      --resize 256 \
+      --imagesize 224 \
+      -d safe_pose \
+      custom $datapath
