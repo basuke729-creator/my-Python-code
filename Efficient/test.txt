@@ -128,3 +128,26 @@ def plot_confusion_matrix_from_scores(
         save_path=cm_save_path,
         class_names=("normal", "abnormal"),
     )
+
+
+            # ===== pixel-wise 評価（オリジナル機能を保持） =====
+            pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(
+                segmentations, masks_gt
+            )
+            full_pixel_auroc = pixel_scores["auroc"]
+
+            # 非ゼロのマスクがある画像だけを対象にする
+            sel_idxs = [i for i in range(len(masks_gt)) if np.sum(masks_gt[i]) > 0]
+
+            if len(sel_idxs) > 0:
+                pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(
+                    [segmentations[i] for i in sel_idxs],
+                    [masks_gt[i] for i in sel_idxs],
+                )
+                anomaly_pixel_auroc = pixel_scores["auroc"]
+            else:
+                LOGGER.warning(
+                    "No non-empty ground-truth masks found; "
+                    "skipping anomaly-only pixel-wise metrics."
+                )
+                anomaly_pixel_auroc = float("nan")
