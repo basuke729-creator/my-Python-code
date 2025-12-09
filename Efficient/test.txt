@@ -6,3 +6,34 @@ python preview_random_erasing.py \
   --scale-min 0.02 \
   --scale-max 0.4 \
   --repeats 3
+
+
+#!/usr/bin/env bash
+
+cd "$(dirname "$0")"
+
+export PYTHONPATH=src
+datapath=../../datasets/pose_dataset
+
+python bin/run_patchcore.py \
+  --gpu 0 \
+  --seed 0 \
+  --save_patchcore_model \
+  --log_group safe_pose_train \
+  --log_project pose_results \
+  results \
+  patch_core \
+      -b wideresnet50 \
+      -le layer2 -le layer3 \
+      --faiss_on_gpu \
+      --pretrain_embed_dimension 1024 \
+      --target_embed_dimension 1024 \
+      --anomaly_scorer_num_nn 1 \
+      --patchsize 3 \
+  sampler \
+      -p 0.1 approx_greedy_coreset \
+  dataset \
+      --resize 256 \
+      --imagesize 224 \
+      -d safe_pose \
+      custom $datapath
