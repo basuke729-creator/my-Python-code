@@ -23,12 +23,12 @@ _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
 
 
 def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
-    """枚数ベース＋行正規化(%)の混同行列を保存する。"""
+    """枚数ベース＋行正規化(%)の混同行列を保存する（どちらもBlues）。"""
     os.makedirs(save_dir, exist_ok=True)
 
-    # ===== 枚数ベース =====
+    # ===== 枚数ベース（counts）=====
     fig, ax = plt.subplots()
-    im = ax.imshow(cm, vmin=0, vmax=cm.max())
+    im = ax.imshow(cm, vmin=0, vmax=max(1, cm.max()), cmap="Blues")
     ax.set_xticks(range(len(class_names)))
     ax.set_yticks(range(len(class_names)))
     ax.set_xticklabels(class_names, rotation=45, ha="right")
@@ -37,6 +37,7 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     ax.set_ylabel("True label")
     ax.set_title("PatchCore Confusion Matrix (counts)")
 
+    vmax = max(1, cm.max())
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
             ax.text(
@@ -45,7 +46,7 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
                 str(cm[i, j]),
                 ha="center",
                 va="center",
-                color="white" if cm[i, j] > cm.max() * 0.5 else "black",
+                color="white" if cm[i, j] > vmax * 0.5 else "black",
             )
 
     fig.colorbar(im, ax=ax)
@@ -55,8 +56,8 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
 
     # ===== 行方向で正規化(%) =====
     with np.errstate(divide="ignore", invalid="ignore"):
-        cm_norm = cm.astype(np.float32) / cm.sum(axis=1, keepdims=True)
-        cm_norm = np.nan_to_num(cm_norm)  # 0割り対策
+        denom = cm.sum(axis=1, keepdims=True)
+        cm_norm = np.divide(cm.astype(np.float32), denom, out=np.zeros_like(cm, dtype=np.float32), where=(denom != 0))
 
     fig, ax = plt.subplots()
     im = ax.imshow(cm_norm, vmin=0.0, vmax=1.0, cmap="Blues")
@@ -96,7 +97,7 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--log_group", type=str, default="group")
 @click.option("--log_project", type=str, default="project")
-@click.option("--save_segmentation_images", is_flag=True)
+@click.option("--save_segmentation_images", is_flag=True, help="ヒートマップ(セグメンテーション画像)を保存する")
 @click.option("--save_patchcore_model", is_flag=True)
 def main(**kwargs):
     pass
@@ -122,7 +123,6 @@ def run(
     list_of_dataloaders = methods["get_dataloaders"](seed)
 
     device = patchcore.utils.set_torch_device(gpu)
-    # GPU メモリリーク対策のため context manager を使う
     device_context = (
         torch.cuda.device(f"cuda:{device.index}")
         if "cuda" in device.type.lower()
@@ -145,41 +145,34 @@ def run(
 
         with device_context:
             torch.cuda.empty_cache()
+
             imagesize = dataloaders["training"].dataset.imagesize
             sampler = methods["get_sampler"](device)
             PatchCore_list = methods["get_patchcore"](imagesize, sampler, device)
 
             if len(PatchCore_list) > 1:
-                LOGGER.info(
-                    "Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list))
-                )
+                LOGGER.info("Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list)))
 
-            # ====== 学習 ======
+            # ===== 学習 =====
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
                 if PatchCore.backbone.seed is not None:
                     patchcore.utils.fix_seeds(PatchCore.backbone.seed, device)
                 LOGGER.info("Training models ({}/{})".format(i + 1, len(PatchCore_list)))
-                torch.cuda.empty_cache()
                 PatchCore.fit(dataloaders["training"])
 
-            # ====== 推論 ======
+            # ===== 推論（test）=====
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
+
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
-                LOGGER.info(
-                    "Embedding test data with models ({}/{})".format(
-                        i + 1, len(PatchCore_list)
-                    )
-                )
-                scores, segmentations, labels_gt, masks_gt = PatchCore.predict(
-                    dataloaders["testing"]
-                )
+                LOGGER.info("Embedding test data with models ({}/{})".format(i + 1, len(PatchCore_list)))
+                scores, segmentations, labels_gt, masks_gt = PatchCore.predict(dataloaders["testing"])
                 aggregator["scores"].append(scores)
                 aggregator["segmentations"].append(segmentations)
 
-            # Ensemble 正規化
+            # ===== Ensemble 正規化（元の公式処理に合わせる）=====
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
@@ -197,43 +190,29 @@ def run(
                 .max(axis=-1)
                 .reshape(-1, 1, 1, 1)
             )
-            segmentations = (segmentations - min_scores) / (
-                max_scores - min_scores + 1e-12
-            )
+            segmentations = (segmentations - min_scores) / (max_scores - min_scores + 1e-12)
             segmentations = np.mean(segmentations, axis=0)
 
-            # True label（元データに対して "good" 以外を異常とみなす）
+            # True label（"good" 以外を異常扱い）
             anomaly_labels = [
                 x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
             ]
 
-            # ===== (オプション) セグメンテーション画像の保存 =====
+            # ===== ヒートマップ可視化（segmentation_images）=====
             if save_segmentation_images:
-                image_paths = [
-                    x[2] for x in dataloaders["testing"].dataset.data_to_iterate
-                ]
-                mask_paths = [
-                    x[3] for x in dataloaders["testing"].dataset.data_to_iterate
-                ]
+                image_paths = [x[2] for x in dataloaders["testing"].dataset.data_to_iterate]
+                mask_paths = [x[3] for x in dataloaders["testing"].dataset.data_to_iterate]
 
                 def image_transform(image):
-                    in_std = np.array(
-                        dataloaders["testing"].dataset.transform_std
-                    ).reshape(-1, 1, 1)
-                    in_mean = np.array(
-                        dataloaders["testing"].dataset.transform_mean
-                    ).reshape(-1, 1, 1)
+                    in_std = np.array(dataloaders["testing"].dataset.transform_std).reshape(-1, 1, 1)
+                    in_mean = np.array(dataloaders["testing"].dataset.transform_mean).reshape(-1, 1, 1)
                     image = dataloaders["testing"].dataset.transform_img(image)
-                    return np.clip(
-                        (image.numpy() * in_std + in_mean) * 255, 0, 255
-                    ).astype(np.uint8)
+                    return np.clip((image.numpy() * in_std + in_mean) * 255, 0, 255).astype(np.uint8)
 
                 def mask_transform(mask):
                     return dataloaders["testing"].dataset.transform_mask(mask).numpy()
 
-                image_save_path = os.path.join(
-                    run_save_path, "segmentation_images", dataset_name
-                )
+                image_save_path = os.path.join(run_save_path, "segmentation_images", dataset_name)
                 os.makedirs(image_save_path, exist_ok=True)
                 patchcore.utils.plot_segmentation_images(
                     image_save_path,
@@ -244,25 +223,17 @@ def run(
                     image_transform=image_transform,
                     mask_transform=mask_transform,
                 )
+                LOGGER.info("Saved segmentation/heatmap images to: %s", image_save_path)
 
             # ===== 評価指標 =====
             LOGGER.info("Computing evaluation metrics.")
-            image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(
-                scores, anomaly_labels
-            )
+            image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(scores, anomaly_labels)
             auroc = image_metrics["auroc"]
 
-            # Pixel-wise AUROC
-            pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(
-                segmentations, masks_gt
-            )
+            pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(segmentations, masks_gt)
             full_pixel_auroc = pixel_scores["auroc"]
 
-            # 異常ピクセルを含む画像だけに絞った AUROC
-            sel_idxs = []
-            for i in range(len(masks_gt)):
-                if np.sum(masks_gt[i]) > 0:
-                    sel_idxs.append(i)
+            sel_idxs = [i for i in range(len(masks_gt)) if np.sum(masks_gt[i]) > 0]
             if len(sel_idxs) > 0:
                 pixel_scores_anom = patchcore.metrics.compute_pixelwise_retrieval_metrics(
                     [segmentations[i] for i in sel_idxs],
@@ -280,27 +251,23 @@ def run(
                     "anomaly_pixel_auroc": anomaly_pixel_auroc,
                 }
             )
-
             for key, item in result_collect[-1].items():
                 if key != "dataset_name":
                     LOGGER.info("{0}: {1:3.3f}".format(key, item))
 
-            # ===== 混同行列 (2×2) の作成 =====
+            # ===== 混同行列 =====
             class_names = ["normal", "abnormal"]
             y_true = np.asarray(anomaly_labels, dtype=int)
 
-            # しきい値：metrics に optimal_threshold があればそれを使用
-            # なければスコアの 95 パーセンタイル
-            threshold = image_metrics.get(
-                "optimal_threshold", float(np.percentile(scores, 95.0))
-            )
+            # しきい値：metrics に optimal_threshold があればそれ、なければ95%tile
+            threshold = image_metrics.get("optimal_threshold", float(np.percentile(scores, 95.0)))
             y_pred = (scores >= threshold).astype(int)
 
             cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
             cm_save_dir = os.path.join(run_save_path, "confusion_matrices")
             plot_confusion_matrices(cm, class_names, cm_save_dir, dataset_name)
 
-            # ===== テスト画像を normal / abnormal に仕分け =====
+            # ===== テスト画像を normal / abnormal に仕分けコピー =====
             sorted_base = os.path.join(run_save_path, "sorted_images", dataset_name)
             normal_dir = os.path.join(sorted_base, "normal")
             abnormal_dir = os.path.join(sorted_base, "abnormal")
@@ -317,11 +284,11 @@ def run(
                 except Exception as e:
                     LOGGER.warning("Could not copy image %s: %s", img_path, e)
 
-            # ===== PatchCore モデルの保存 (オプション) =====
+            LOGGER.info("Saved sorted images to: %s", sorted_base)
+
+            # ===== PatchCore モデル保存 =====
             if save_patchcore_model:
-                patchcore_save_path = os.path.join(
-                    run_save_path, "models", dataset_name
-                )
+                patchcore_save_path = os.path.join(run_save_path, "models", dataset_name)
                 os.makedirs(patchcore_save_path, exist_ok=True)
                 for i, PatchCore in enumerate(PatchCore_list):
                     prepend = (
@@ -333,7 +300,7 @@ def run(
 
         LOGGER.info("\n\n-----\n")
 
-    # ===== 全データセットの結果を CSV に保存 =====
+    # ===== 全データセット結果をCSVに保存 =====
     result_metric_names = list(result_collect[-1].keys())[1:]
     result_dataset_names = [results["dataset_name"] for results in result_collect]
     result_scores = [list(results.values())[1:] for results in result_collect]
@@ -346,22 +313,17 @@ def run(
 
 
 @main.command("patch_core")
-# Pretraining-specific parameters.
 @click.option("--backbone_names", "-b", type=str, multiple=True, default=[])
 @click.option("--layers_to_extract_from", "-le", type=str, multiple=True, default=[])
-# Parameters for Glue-code (to merge different parts of the pipeline).
 @click.option("--pretrain_embed_dimension", type=int, default=1024)
 @click.option("--target_embed_dimension", type=int, default=1024)
 @click.option("--preprocessing", type=click.Choice(["mean", "conv"]), default="mean")
 @click.option("--aggregation", type=click.Choice(["mean", "mlp"]), default="mean")
-# Nearest-Neighbour Anomaly Scorer parameters.
 @click.option("--anomaly_scorer_num_nn", type=int, default=5)
-# Patch-parameters.
 @click.option("--patchsize", type=int, default=3)
 @click.option("--patchscore", type=str, default="max")
 @click.option("--patchoverlap", type=float, default=0.0)
 @click.option("--patchsize_aggregate", "-pa", type=int, multiple=True, default=[])
-# NN on GPU.
 @click.option("--faiss_on_gpu", is_flag=True)
 @click.option("--faiss_num_workers", type=int, default=8)
 def patch_core(
@@ -391,14 +353,11 @@ def patch_core(
 
     def get_patchcore(input_shape, sampler, device):
         loaded_patchcores = []
-        for backbone_name, layers_to_extract_from in zip(
-            backbone_names, layers_to_extract_from_coll
-        ):
+        for backbone_name, layers_to_extract_from in zip(backbone_names, layers_to_extract_from_coll):
             backbone_seed = None
             if ".seed-" in backbone_name:
-                backbone_name, backbone_seed = backbone_name.split(".seed-")[0], int(
-                    backbone_name.split("-")[-1]
-                )
+                backbone_name, backbone_seed = backbone_name.split(".seed-")[0], int(backbone_name.split("-")[-1])
+
             backbone = patchcore.backbones.load(backbone_name)
             backbone.name, backbone.seed = backbone_name, backbone_seed
 
@@ -515,7 +474,6 @@ def dataset(
                     split=dataset_library.DatasetSplit.VAL,
                     seed=seed,
                 )
-
                 val_dataloader = torch.utils.data.DataLoader(
                     val_dataset,
                     batch_size=batch_size,
@@ -526,11 +484,7 @@ def dataset(
             else:
                 val_dataloader = None
 
-            dataloader_dict = {
-                "training": train_dataloader,
-                "validation": val_dataloader,
-                "testing": test_dataloader,
-            }
+            dataloader_dict = {"training": train_dataloader, "validation": val_dataloader, "testing": test_dataloader}
             dataloaders.append(dataloader_dict)
         return dataloaders
 
@@ -541,3 +495,4 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     LOGGER.info("Command line arguments: {}".format(" ".join(sys.argv)))
     main()
+
