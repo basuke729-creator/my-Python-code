@@ -2,14 +2,14 @@ import contextlib
 import logging
 import os
 import sys
-import shutil
+import shutil  # （仕分け機能はコメントアウトで停止中だが、将来戻せるよう残す）
 import time
 
 import click
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt  # （confusion matrixはコメントアウトで停止中だが、将来戻せるよう残す）
+from sklearn.metrics import confusion_matrix  # （同上）
 
 import patchcore.backbones
 import patchcore.common
@@ -23,14 +23,22 @@ LOGGER = logging.getLogger(__name__)
 _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
 
 
+# =========================
+# 推論時間計測 設定
+# =========================
+BENCH_NUM_RUNS = 105   # 合計実行回数
+BENCH_WARMUP = 5       # 最初の捨てる回数（ウォームアップ）
+# ※ CPU含めて測りたいので、DataLoader + 前処理 + 推論 + 後処理(予測出力生成まで)を含む
+# ※ 画像保存・コピー・matplotlib描画はコメントアウトで除外
+
+
 def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     """枚数ベース＋行正規化(%)の混同行列を保存する。"""
     os.makedirs(save_dir, exist_ok=True)
 
     # ===== 枚数ベース =====
     fig, ax = plt.subplots()
-    # ★ counts 側もブルーに統一
-    im = ax.imshow(cm, vmin=0, vmax=cm.max(), cmap="Blues")
+    im = ax.imshow(cm, vmin=0, vmax=cm.max(), cmap="Blues")  # counts も Blues に
     ax.set_xticks(range(len(class_names)))
     ax.set_yticks(range(len(class_names)))
     ax.set_xticklabels(class_names, rotation=45, ha="right")
@@ -92,68 +100,14 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     LOGGER.info("  norm  : %s", norm_path)
 
 
-def benchmark_patchcore_predict(
-    patchcore_instance,
-    dataloader,
-    device,
-    repeats=105,
-    warmup=5,
-):
-    """
-    PatchCore.predict(dataloader) のみをGPU同期付きで厳密計測する。
-    - repeats 回実行
-    - 最初 warmup 回は破棄
-    - 以降の平均/分位点などを返す
-    """
-    if repeats <= warmup:
-        raise ValueError("repeats must be > warmup")
-
-    times_ms = []
-
-    for i in range(repeats):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-
-        t0 = time.perf_counter()
-
-        # ---- 推論本体（ここだけ測る）----
-        _scores, _segmentations, _labels_gt, _masks_gt = patchcore_instance.predict(dataloader)
-
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-
-        if i >= warmup:
-            times_ms.append(elapsed_ms)
-
-    arr = np.array(times_ms, dtype=np.float64)
-    return {
-        "repeats": repeats,
-        "warmup": warmup,
-        "measured": int(arr.size),
-        "mean_ms": float(arr.mean()),
-        "std_ms": float(arr.std(ddof=1)) if arr.size > 1 else 0.0,
-        "p50_ms": float(np.percentile(arr, 50)),
-        "p90_ms": float(np.percentile(arr, 90)),
-        "p99_ms": float(np.percentile(arr, 99)),
-        "min_ms": float(arr.min()),
-        "max_ms": float(arr.max()),
-    }
-
-
 @click.group(chain=True)
 @click.argument("results_path", type=str)
 @click.option("--gpu", type=int, default=[0], multiple=True, show_default=True)
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--log_group", type=str, default="group")
 @click.option("--log_project", type=str, default="project")
-@click.option("--save_segmentation_images", is_flag=True)
+@click.option("--save_segmentation_images", is_flag=True)  # 今回コメントアウトで無効化（後で戻せる）
 @click.option("--save_patchcore_model", is_flag=True)
-# ★ 追加：推論ベンチマーク用オプション
-@click.option("--benchmark_infer", is_flag=True, help="Benchmark PatchCore.predict() only (GPU-synchronized).")
-@click.option("--bench_repeats", type=int, default=105, show_default=True)
-@click.option("--bench_warmup", type=int, default=5, show_default=True)
 def main(**kwargs):
     pass
 
@@ -168,9 +122,6 @@ def run(
     log_project,
     save_segmentation_images,
     save_patchcore_model,
-    benchmark_infer,
-    bench_repeats,
-    bench_warmup,
 ):
     methods = {key: item for (key, item) in methods}
 
@@ -222,57 +173,10 @@ def run(
                 torch.cuda.empty_cache()
                 PatchCore.fit(dataloaders["training"])
 
-            # ====== ベンチマーク（推論のみ計測） ======
-            if benchmark_infer:
-                LOGGER.info(
-                    "Benchmark mode enabled: measuring PatchCore.predict() only. "
-                    "repeats=%d warmup=%d (GPU synchronized)",
-                    bench_repeats, bench_warmup
-                )
-                bench_dir = os.path.join(run_save_path, "benchmark_infer", dataset_name)
-                os.makedirs(bench_dir, exist_ok=True)
-
-                all_means = []
-                for i, PatchCore in enumerate(PatchCore_list):
-                    torch.cuda.empty_cache()
-                    res = benchmark_patchcore_predict(
-                        PatchCore,
-                        dataloaders["testing"],
-                        device,
-                        repeats=bench_repeats,
-                        warmup=bench_warmup,
-                    )
-                    all_means.append(res["mean_ms"])
-                    LOGGER.info(
-                        "[Benchmark %s] Model %d/%d | mean=%.3f ms  std=%.3f  p50=%.3f  p90=%.3f  p99=%.3f  min=%.3f  max=%.3f",
-                        dataset_name,
-                        i + 1,
-                        len(PatchCore_list),
-                        res["mean_ms"],
-                        res["std_ms"],
-                        res["p50_ms"],
-                        res["p90_ms"],
-                        res["p99_ms"],
-                        res["min_ms"],
-                        res["max_ms"],
-                    )
-
-                if len(all_means) > 1:
-                    LOGGER.info(
-                        "[Benchmark %s] Ensemble mean of means: %.3f ms",
-                        dataset_name,
-                        float(np.mean(all_means)),
-                    )
-
-                LOGGER.info(
-                    "Benchmark mode: skipping segmentation images / metrics / confusion matrix / sorting / model save for this dataset."
-                )
-                LOGGER.info("\n\n-----\n")
-                continue
-
-            # ====== 推論 ======
+            # ====== 推論（105回計測・最初5回捨て） ======
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
+
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
                 LOGGER.info(
@@ -280,13 +184,59 @@ def run(
                         i + 1, len(PatchCore_list)
                     )
                 )
-                scores, segmentations, labels_gt, masks_gt = PatchCore.predict(
-                    dataloaders["testing"]
-                )
-                aggregator["scores"].append(scores)
-                aggregator["segmentations"].append(segmentations)
 
-            # Ensemble 正規化
+                # ベンチマーク
+                times = []
+                last_scores = None
+                last_segmentations = None
+                last_labels_gt = None
+                last_masks_gt = None
+
+                for run_idx in range(BENCH_NUM_RUNS):
+                    # GPUの非同期実行を完全に揃える
+                    if "cuda" in device.type.lower():
+                        torch.cuda.synchronize()
+
+                    t0 = time.perf_counter()
+
+                    scores, segmentations, labels_gt, masks_gt = PatchCore.predict(
+                        dataloaders["testing"]
+                    )
+
+                    if "cuda" in device.type.lower():
+                        torch.cuda.synchronize()
+
+                    t1 = time.perf_counter()
+
+                    # ウォームアップ分は捨てる
+                    if run_idx >= BENCH_WARMUP:
+                        times.append(t1 - t0)
+
+                    # 最終結果は最後の実行のものを採用（評価用）
+                    last_scores = scores
+                    last_segmentations = segmentations
+                    last_labels_gt = labels_gt
+                    last_masks_gt = masks_gt
+
+                avg_time = float(np.mean(times)) if len(times) > 0 else float("nan")
+                LOGGER.info(
+                    "Inference time (avg of %d runs, warmup %d) [model %d/%d]: %.6f sec",
+                    len(times),
+                    BENCH_WARMUP,
+                    i + 1,
+                    len(PatchCore_list),
+                    avg_time,
+                )
+
+                # アンサンブル用に最後の推論結果を使用
+                aggregator["scores"].append(last_scores)
+                aggregator["segmentations"].append(last_segmentations)
+
+                # labels/masksは全モデル同一入力なので最後のものを採用
+                labels_gt = last_labels_gt
+                masks_gt = last_masks_gt
+
+            # ===== Ensemble 正規化 =====
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
@@ -304,9 +254,7 @@ def run(
                 .max(axis=-1)
                 .reshape(-1, 1, 1, 1)
             )
-            segmentations = (segmentations - min_scores) / (
-                max_scores - min_scores + 1e-12
-            )
+            segmentations = (segmentations - min_scores) / (max_scores - min_scores + 1e-12)
             segmentations = np.mean(segmentations, axis=0)
 
             # True label（元データに対して "good" 以外を異常とみなす）
@@ -314,45 +262,41 @@ def run(
                 x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
             ]
 
+            # ============================================================
+            # 以下、今回「計測を純粋化」するためにコメントアウトで停止
+            #   - segmentation_images 保存
+            #   - confusion matrix 画像出力
+            #   - normal/abnormal 仕分けコピー
+            # ============================================================
+
             # ===== (オプション) セグメンテーション画像の保存 =====
-            if save_segmentation_images:
-                image_paths = [
-                    x[2] for x in dataloaders["testing"].dataset.data_to_iterate
-                ]
-                mask_paths = [
-                    x[3] for x in dataloaders["testing"].dataset.data_to_iterate
-                ]
+            # ※ 計測時はノイズになるので停止
+            # if save_segmentation_images:
+            #     image_paths = [x[2] for x in dataloaders["testing"].dataset.data_to_iterate]
+            #     mask_paths = [x[3] for x in dataloaders["testing"].dataset.data_to_iterate]
+            #
+            #     def image_transform(image):
+            #         in_std = np.array(dataloaders["testing"].dataset.transform_std).reshape(-1, 1, 1)
+            #         in_mean = np.array(dataloaders["testing"].dataset.transform_mean).reshape(-1, 1, 1)
+            #         image = dataloaders["testing"].dataset.transform_img(image)
+            #         return np.clip((image.numpy() * in_std + in_mean) * 255, 0, 255).astype(np.uint8)
+            #
+            #     def mask_transform(mask):
+            #         return dataloaders["testing"].dataset.transform_mask(mask).numpy()
+            #
+            #     image_save_path = os.path.join(run_save_path, "segmentation_images", dataset_name)
+            #     os.makedirs(image_save_path, exist_ok=True)
+            #     patchcore.utils.plot_segmentation_images(
+            #         image_save_path,
+            #         image_paths,
+            #         segmentations,
+            #         scores,
+            #         mask_paths,
+            #         image_transform=image_transform,
+            #         mask_transform=mask_transform,
+            #     )
 
-                def image_transform(image):
-                    in_std = np.array(
-                        dataloaders["testing"].dataset.transform_std
-                    ).reshape(-1, 1, 1)
-                    in_mean = np.array(
-                        dataloaders["testing"].dataset.transform_mean
-                    ).reshape(-1, 1, 1)
-                    image = dataloaders["testing"].dataset.transform_img(image)
-                    return np.clip(
-                        (image.numpy() * in_std + in_mean) * 255, 0, 255
-                    ).astype(np.uint8)
-
-                def mask_transform(mask):
-                    return dataloaders["testing"].dataset.transform_mask(mask).numpy()
-
-                image_save_path = os.path.join(
-                    run_save_path, "segmentation_images", dataset_name
-                )
-                os.makedirs(image_save_path, exist_ok=True)
-                patchcore.utils.plot_segmentation_images(
-                    image_save_path,
-                    image_paths,
-                    segmentations,
-                    scores,
-                    mask_paths,
-                    image_transform=image_transform,
-                    mask_transform=mask_transform,
-                )
-
-            # ===== 評価指標 =====
+            # ===== 評価指標（これは残す：純粋精度も見たい前提） =====
             LOGGER.info("Computing evaluation metrics.")
             image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(
                 scores, anomaly_labels
@@ -367,13 +311,14 @@ def run(
 
             # 異常ピクセルを含む画像だけに絞った AUROC
             sel_idxs = []
-            for i in range(len(masks_gt)):
-                if np.sum(masks_gt[i]) > 0:
-                    sel_idxs.append(i)
+            for k in range(len(masks_gt)):
+                if np.sum(masks_gt[k]) > 0:
+                    sel_idxs.append(k)
+
             if len(sel_idxs) > 0:
                 pixel_scores_anom = patchcore.metrics.compute_pixelwise_retrieval_metrics(
-                    [segmentations[i] for i in sel_idxs],
-                    [masks_gt[i] for i in sel_idxs],
+                    [segmentations[k] for k in sel_idxs],
+                    [masks_gt[k] for k in sel_idxs],
                 )
                 anomaly_pixel_auroc = pixel_scores_anom["auroc"]
             else:
@@ -392,43 +337,37 @@ def run(
                 if key != "dataset_name":
                     LOGGER.info("{0}: {1:3.3f}".format(key, item))
 
-            # ===== 混同行列 (2×2) の作成 =====
-            class_names = ["normal", "abnormal"]
-            y_true = np.asarray(anomaly_labels, dtype=int)
-
-            # しきい値：metrics に optimal_threshold があればそれを使用
-            # なければスコアの 95 パーセンタイル
-            threshold = image_metrics.get(
-                "optimal_threshold", float(np.percentile(scores, 95.0))
-            )
-            y_pred = (scores >= threshold).astype(int)
-
-            cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-            cm_save_dir = os.path.join(run_save_path, "confusion_matrices")
-            plot_confusion_matrices(cm, class_names, cm_save_dir, dataset_name)
+            # ===== 混同行列 (2×2) の作成・保存 =====
+            # ※ 計測時はmatplotlibが重いので停止
+            # class_names = ["normal", "abnormal"]
+            # y_true = np.asarray(anomaly_labels, dtype=int)
+            # threshold = image_metrics.get("optimal_threshold", float(np.percentile(scores, 95.0)))
+            # y_pred = (scores >= threshold).astype(int)
+            # cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+            # cm_save_dir = os.path.join(run_save_path, "confusion_matrices")
+            # plot_confusion_matrices(cm, class_names, cm_save_dir, dataset_name)
 
             # ===== テスト画像を normal / abnormal に仕分け =====
-            sorted_base = os.path.join(run_save_path, "sorted_images", dataset_name)
-            normal_dir = os.path.join(sorted_base, "normal")
-            abnormal_dir = os.path.join(sorted_base, "abnormal")
-            os.makedirs(normal_dir, exist_ok=True)
-            os.makedirs(abnormal_dir, exist_ok=True)
-
-            test_data = dataloaders["testing"].dataset.data_to_iterate
-            for idx, score_val in enumerate(scores):
-                img_path = test_data[idx][2]
-                pred_label = "abnormal" if score_val >= threshold else "normal"
-                dst_dir = abnormal_dir if pred_label == "abnormal" else normal_dir
-                try:
-                    shutil.copy2(img_path, dst_dir)
-                except Exception as e:
-                    LOGGER.warning("Could not copy image %s: %s", img_path, e)
+            # ※ 計測時はディスクI/Oが重いので停止
+            # threshold = image_metrics.get("optimal_threshold", float(np.percentile(scores, 95.0)))
+            # sorted_base = os.path.join(run_save_path, "sorted_images", dataset_name)
+            # normal_dir = os.path.join(sorted_base, "normal")
+            # abnormal_dir = os.path.join(sorted_base, "abnormal")
+            # os.makedirs(normal_dir, exist_ok=True)
+            # os.makedirs(abnormal_dir, exist_ok=True)
+            # test_data = dataloaders["testing"].dataset.data_to_iterate
+            # for idx, score_val in enumerate(scores):
+            #     img_path = test_data[idx][2]
+            #     pred_label = "abnormal" if score_val >= threshold else "normal"
+            #     dst_dir = abnormal_dir if pred_label == "abnormal" else normal_dir
+            #     try:
+            #         shutil.copy2(img_path, dst_dir)
+            #     except Exception as e:
+            #         LOGGER.warning("Could not copy image %s: %s", img_path, e)
 
             # ===== PatchCore モデルの保存 (オプション) =====
             if save_patchcore_model:
-                patchcore_save_path = os.path.join(
-                    run_save_path, "models", dataset_name
-                )
+                patchcore_save_path = os.path.join(run_save_path, "models", dataset_name)
                 os.makedirs(patchcore_save_path, exist_ok=True)
                 for i, PatchCore in enumerate(PatchCore_list):
                     prepend = (
@@ -453,22 +392,17 @@ def run(
 
 
 @main.command("patch_core")
-# Pretraining-specific parameters.
 @click.option("--backbone_names", "-b", type=str, multiple=True, default=[])
 @click.option("--layers_to_extract_from", "-le", type=str, multiple=True, default=[])
-# Parameters for Glue-code (to merge different parts of the pipeline).
 @click.option("--pretrain_embed_dimension", type=int, default=1024)
 @click.option("--target_embed_dimension", type=int, default=1024)
 @click.option("--preprocessing", type=click.Choice(["mean", "conv"]), default="mean")
 @click.option("--aggregation", type=click.Choice(["mean", "mlp"]), default="mean")
-# Nearest-Neighbour Anomaly Scorer parameters.
 @click.option("--anomaly_scorer_num_nn", type=int, default=5)
-# Patch-parameters.
 @click.option("--patchsize", type=int, default=3)
 @click.option("--patchscore", type=str, default="max")
 @click.option("--patchoverlap", type=float, default=0.0)
 @click.option("--patchsize_aggregate", "-pa", type=int, multiple=True, default=[])
-# NN on GPU.
 @click.option("--faiss_on_gpu", is_flag=True)
 @click.option("--faiss_num_workers", type=int, default=8)
 def patch_core(
@@ -648,3 +582,4 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     LOGGER.info("Command line arguments: {}".format(" ".join(sys.argv)))
     main()
+
