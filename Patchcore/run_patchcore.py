@@ -23,10 +23,10 @@ _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
 
 
 def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
-    """counts と 行正規化(%) の混同行列を保存"""
+    """枚数ベース＋行正規化(%)の混同行列を保存する（どちらもBlues）。"""
     os.makedirs(save_dir, exist_ok=True)
 
-    # ===== counts =====
+    # ===== 枚数ベース（counts）=====
     fig, ax = plt.subplots()
     im = ax.imshow(cm, vmin=0, vmax=max(1, cm.max()), cmap="Blues")
     ax.set_xticks(range(len(class_names)))
@@ -54,7 +54,7 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     fig.savefig(count_path, bbox_inches="tight", dpi=200)
     plt.close(fig)
 
-    # ===== row-normalized (%) =====
+    # ===== 行方向で正規化(%) =====
     with np.errstate(divide="ignore", invalid="ignore"):
         denom = cm.sum(axis=1, keepdims=True)
         cm_norm = np.divide(
@@ -94,109 +94,6 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     LOGGER.info("Saved confusion matrices to:")
     LOGGER.info("  counts: %s", count_path)
     LOGGER.info("  norm  : %s", norm_path)
-
-
-def _get_mean_std_from_dataset(ds):
-    """
-    環境差が大きいので、存在する属性から平均・分散を拾う。
-    無ければ (None, None) を返す。
-    """
-    mean = None
-    std = None
-
-    # まずあなたが以前書いていた属性
-    if hasattr(ds, "transform_mean"):
-        mean = ds.transform_mean
-    if hasattr(ds, "transform_std"):
-        std = ds.transform_std
-
-    # 他でありがちな名前
-    if mean is None and hasattr(ds, "mean"):
-        mean = ds.mean
-    if std is None and hasattr(ds, "std"):
-        std = ds.std
-
-    # torchvision transforms の Normalize を掘る（入ってる場合だけ）
-    # ds.transform_img が Compose のとき、.transforms 内に Normalize があることがある
-    try:
-        t = getattr(ds, "transform_img", None)
-        if (mean is None or std is None) and hasattr(t, "transforms"):
-            for tr in t.transforms:
-                cname = tr.__class__.__name__.lower()
-                if "normalize" in cname:
-                    if mean is None:
-                        mean = tr.mean
-                    if std is None:
-                        std = tr.std
-                    break
-    except Exception:
-        pass
-
-    if mean is not None:
-        mean = np.array(mean, dtype=np.float32).reshape(-1, 1, 1)
-    if std is not None:
-        std = np.array(std, dtype=np.float32).reshape(-1, 1, 1)
-
-    return mean, std
-
-
-def _image_transform_for_plot(ds, image):
-    """
-    patchcore.utils.plot_segmentation_images() は内部で
-    image.transpose(1,2,0) をする (= 入力は CHW を想定)
-    なので、ここは必ず (C,H,W) uint8 を返す。
-    """
-    x = ds.transform_img(image)  # torch Tensor を想定
-
-    if isinstance(x, torch.Tensor):
-        x = x.detach().cpu()
-        # 形が (H,W,C) の場合は CHW に戻す
-        if x.ndim == 3 and x.shape[0] not in (1, 3) and x.shape[-1] in (1, 3):
-            x = x.permute(2, 0, 1)
-        x = x.numpy()
-    else:
-        x = np.asarray(x)
-
-    # ここで x は CHW を保証したい
-    if x.ndim != 3:
-        raise ValueError(f"Unexpected image tensor shape: {x.shape}")
-    if x.shape[0] not in (1, 3):
-        # もし HWC が紛れ込んでいたら救済
-        if x.shape[2] in (1, 3):
-            x = np.transpose(x, (2, 0, 1))
-        else:
-            raise ValueError(f"Cannot interpret image shape as CHW or HWC: {x.shape}")
-
-    mean, std = _get_mean_std_from_dataset(ds)
-
-    # denorm が取れれば denorm、取れなければ 0..1 想定で 255 スケール
-    if (mean is not None) and (std is not None) and mean.shape[0] == x.shape[0]:
-        x = (x * std + mean) * 255.0
-    else:
-        x = x * 255.0
-
-    x = np.clip(x, 0, 255).astype(np.uint8)
-    return x  # CHW uint8
-
-
-def _mask_transform_for_plot(ds, mask):
-    """
-    plot_segmentation_images() は mask を numpy にして使うだけなので
-    ここは HW を返せばOK。
-    """
-    try:
-        m = ds.transform_mask(mask)
-        if isinstance(m, torch.Tensor):
-            m = m.detach().cpu().numpy()
-        else:
-            m = np.asarray(m)
-    except Exception:
-        m = np.asarray(mask)
-
-    # もし CHW で来たら HW に落とす
-    if m.ndim == 3:
-        m = m[0]
-    return m
 
 
 @click.group(chain=True)
@@ -273,18 +170,14 @@ def run(
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
 
-            # predict は PatchCore 側の実装に依存：最後に回したモデルの labels_gt/masks_gt を使う想定
-            labels_gt = None
-            masks_gt = None
-
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
                 LOGGER.info("Embedding test data with models ({}/{})".format(i + 1, len(PatchCore_list)))
-                scores_i, segmentations_i, labels_gt, masks_gt = PatchCore.predict(dataloaders["testing"])
-                aggregator["scores"].append(scores_i)
-                aggregator["segmentations"].append(segmentations_i)
+                scores, segmentations, labels_gt, masks_gt = PatchCore.predict(dataloaders["testing"])
+                aggregator["scores"].append(scores)
+                aggregator["segmentations"].append(segmentations)
 
-            # ===== Ensemble 正規化（公式処理に合わせる）=====
+            # ===== Ensemble 正規化（元の公式処理に合わせる）=====
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
@@ -317,12 +210,83 @@ def run(
 
                 ds = dataloaders["testing"].dataset
 
+                def _get_mean_std(dataset):
+                    """
+                    transform_mean/std が無い派生実装でも落ちないようにする。
+                    取れない場合は None を返して、un-normalize を諦める。
+                    """
+                    mean = getattr(dataset, "transform_mean", None)
+                    std = getattr(dataset, "transform_std", None)
+                    if mean is None or std is None:
+                        mean = getattr(dataset, "mean", None)
+                        std = getattr(dataset, "std", None)
+                    if mean is None or std is None:
+                        return None, None
+                    mean = np.asarray(mean, dtype=np.float32).reshape(-1, 1, 1)
+                    std = np.asarray(std, dtype=np.float32).reshape(-1, 1, 1)
+                    return mean, std
+
+                mean, std = _get_mean_std(ds)
+
                 def image_transform(image):
-                    # 必ず CHW uint8 を返す（utils.py 内部 transpose に合わせる）
-                    return _image_transform_for_plot(ds, image)
+                    """
+                    patchcore.utils.plot_segmentation_images は
+                    image が CHW を期待して内部で transpose(1,2,0) する。
+                    → ここでは必ず CHW を返す。
+                    """
+                    img = ds.transform_img(image)  # 基本 torch.Tensor (C,H,W)
+                    if isinstance(img, torch.Tensor):
+                        img = img.detach().cpu()
+                        if img.ndim == 3:
+                            pass
+                        elif img.ndim == 4 and img.shape[0] == 1:
+                            img = img[0]
+                        else:
+                            raise ValueError(f"Unexpected transformed image shape: {tuple(img.shape)}")
+                        img_np = img.numpy()
+                    else:
+                        img_np = np.asarray(img)
+                        # HWC の場合は CHW にする
+                        if img_np.ndim == 3 and img_np.shape[-1] in (1, 3):
+                            img_np = np.transpose(img_np, (2, 0, 1))
+
+                    # un-normalize が可能なら戻す
+                    if mean is not None and std is not None and img_np.shape[0] == mean.shape[0]:
+                        img_np = (img_np * std + mean)
+
+                    # 0-255 uint8 へ
+                    img_np = np.clip(img_np * 255.0, 0.0, 255.0).astype(np.uint8)
+
+                    # 必ず CHW
+                    if img_np.ndim != 3:
+                        raise ValueError(f"image_transform must return CHW, got shape={img_np.shape}")
+                    return img_np
 
                 def mask_transform(mask):
-                    return _mask_transform_for_plot(ds, mask)
+                    """
+                    patchcore.utils.plot_segmentation_images は
+                    mask が (1,H,W) を期待して内部で transpose(1,2,0) する。
+                    → ここでは必ず (1,H,W) を返す。
+                    """
+                    m = ds.transform_mask(mask)
+                    if isinstance(m, torch.Tensor):
+                        m = m.detach().cpu().numpy()
+                    else:
+                        m = np.asarray(m)
+
+                    # (H,W) -> (1,H,W)
+                    if m.ndim == 2:
+                        m = m[np.newaxis, :, :]
+                    # (H,W,1) -> (1,H,W)
+                    elif m.ndim == 3 and m.shape[-1] == 1:
+                        m = np.transpose(m, (2, 0, 1))
+                    # (1,H,W) OK
+                    elif m.ndim == 3 and m.shape[0] == 1:
+                        pass
+                    else:
+                        raise ValueError(f"Unexpected mask shape: {m.shape}")
+
+                    return m
 
                 image_save_path = os.path.join(run_save_path, "segmentation_images", dataset_name)
                 os.makedirs(image_save_path, exist_ok=True)
@@ -372,7 +336,6 @@ def run(
             class_names = ["normal", "abnormal"]
             y_true = np.asarray(anomaly_labels, dtype=int)
 
-            # しきい値：metrics に optimal_threshold があればそれ、なければ 95%tile
             threshold = image_metrics.get("optimal_threshold", float(np.percentile(scores, 95.0)))
             y_pred = (scores >= threshold).astype(int)
 
@@ -474,7 +437,6 @@ def patch_core(
             backbone = patchcore.backbones.load(backbone_name)
             backbone.name, backbone.seed = backbone_name, backbone_seed
 
-            # FaissNN の引数はこの repo 実装に合わせる
             nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
 
             patchcore_instance = patchcore.patchcore.PatchCore(device)
