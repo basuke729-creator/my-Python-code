@@ -1,82 +1,99 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-PatchCore inference-only benchmark script.
-
-- Loads a trained PatchCore model from a folder (where patchcore_params.pkl exists)
-- Runs inference 105 times, discards first 5 (warmup), averages remaining 100
-- Uses torch.cuda.synchronize() to measure GPU execution accurately
-- Does NOT save segmentation images / confusion matrices / sorted copies
-
-Expected repo layout (recommended):
-patchcore-inspection/
-  bin/...
-  src/patchcore/...
-  run_patchcore_infer_only.py   <-- this file
-"""
+# run_patchcore_infer_only.py
+# PatchCore inference-only benchmark:
+# - repeat N times, discard warmup, report mean latency
+# - uses torch.cuda.synchronize() for accurate GPU timing
+# - NO image saving / NO confusion matrix / NO copying
 
 import argparse
+import contextlib
+import inspect
+import logging
 import os
+import sys
 import time
-from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
 
 import patchcore.common
-import patchcore.patchcore
 import patchcore.utils
-import patchcore.datasets.mvtec as mvtec
+
+# Dataset import (MVTecDataset)
+_DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
+
+LOGGER = logging.getLogger("infer_only")
 
 
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--model_dir",
-        type=str,
-        required=True,
-        help="Path to trained PatchCore model directory (contains patchcore_params.pkl).",
-    )
-    ap.add_argument(
-        "--data_path",
-        type=str,
-        required=True,
-        help="Dataset root path (mvtec-style). Example: /home/.../datasets/pose_dataset",
-    )
-    ap.add_argument(
-        "--subdataset",
-        type=str,
-        required=True,
-        help="Class name (same as '-d safe_pose' etc). Example: safe_pose",
-    )
+def make_faiss_nn(use_gpu: bool, num_workers: int):
+    """
+    PatchCore実装のバージョン差異を吸収して FaissNN を作る。
+    よくあるパターン:
+      - FaissNN(use_gpu, num_workers)
+      - FaissNN(on_gpu, num_workers)
+      - FaissNN(num_workers)
+    """
+    cls = patchcore.common.FaissNN
+    sig = None
+    try:
+        sig = inspect.signature(cls.__init__)
+    except Exception:
+        sig = None
 
-    ap.add_argument("--gpu", type=int, default=0, help="GPU id. Use -1 for CPU.")
-    ap.add_argument("--batch_size", type=int, default=1, help="Batch size for test loader.")
-    ap.add_argument("--num_workers", type=int, default=4, help="DataLoader workers.")
-    ap.add_argument("--resize", type=int, default=384, help="Resize for dataset.")
-    ap.add_argument("--imagesize", type=int, default=384, help="Image size for dataset.")
+    # まずはキーワード引数で試す（存在しない場合は TypeError になる）
+    if sig is not None:
+        params = sig.parameters
+        # __init__(self, ..., use_gpu=?, num_workers=?)
+        if "use_gpu" in params and "num_workers" in params:
+            return cls(use_gpu=use_gpu, num_workers=num_workers)
+        # __init__(self, ..., on_gpu=?, num_workers=?)
+        if "on_gpu" in params and "num_workers" in params:
+            return cls(on_gpu=use_gpu, num_workers=num_workers)
+        # __init__(self, ..., faiss_on_gpu=?, faiss_num_workers=?)
+        if "faiss_on_gpu" in params and "faiss_num_workers" in params:
+            return cls(faiss_on_gpu=use_gpu, faiss_num_workers=num_workers)
 
-    ap.add_argument("--repeat", type=int, default=105, help="Total inference repetitions.")
-    ap.add_argument("--warmup", type=int, default=5, help="Warmup iterations to discard.")
-    ap.add_argument(
-        "--faiss_on_gpu",
-        action="store_true",
-        help="Use FAISS on GPU (if available). If not set, FAISS on CPU.",
-    )
-    ap.add_argument("--faiss_num_workers", type=int, default=8, help="FAISS worker threads.")
-    return ap.parse_args()
+    # 次に位置引数で試す
+    try:
+        return cls(use_gpu, num_workers)
+    except TypeError:
+        pass
+    try:
+        return cls(use_gpu)
+    except TypeError:
+        pass
+    # 最後：num_workersのみ
+    return cls(num_workers)
 
 
-def make_test_dataloader(data_path: str, classname: str, resize: int, imagesize: int,
-                         batch_size: int, num_workers: int, seed: int = 0):
-    test_dataset = mvtec.MVTecDataset(
+def build_test_dataloader(
+    dataset_name: str,
+    data_path: str,
+    subdataset: str,
+    resize: int,
+    imagesize: int,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+    limit_images: int,
+):
+    dataset_info = _DATASETS[dataset_name]
+    dataset_library = __import__(dataset_info[0], fromlist=[dataset_info[1]])
+    DatasetCls = dataset_library.__dict__[dataset_info[1]]
+
+    test_dataset = DatasetCls(
         data_path,
-        classname=classname,
+        classname=subdataset,
         resize=resize,
         imagesize=imagesize,
-        split=mvtec.DatasetSplit.TEST,
+        split=dataset_library.DatasetSplit.TEST,
         seed=seed,
     )
+
+    if limit_images > 0:
+        limit_images = min(limit_images, len(test_dataset))
+        test_dataset = torch.utils.data.Subset(test_dataset, list(range(limit_images)))
 
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
@@ -85,124 +102,196 @@ def make_test_dataloader(data_path: str, classname: str, resize: int, imagesize:
         num_workers=num_workers,
         pin_memory=True,
     )
-    test_loader.name = f"mvtec_{classname}"
     return test_loader
 
 
-def benchmark_inference(pc: patchcore.patchcore.PatchCore, dataloader,
-                        repeat: int, warmup: int, device: torch.device):
+def load_patchcore_model(model_dir: str, device: torch.device, nn_method):
     """
-    Measures time for pc.predict(dataloader) repeated 'repeat' times.
-    Discards first 'warmup', returns mean/std over remaining iterations.
-
-    NOTE:
-    - This measures the whole "predict over the full test dataloader".
-    - If you want per-image timing, we can change to single-batch or single-image loop.
+    保存済みモデルを読み込む。
+    多くの patchcore 実装では:
+      PatchCore(device).load_from_path(path, device=device, nn_method=nn_method)
+    が必要。
     """
-    times_ms = []
+    import patchcore.patchcore
 
-    # Ensure model in eval mode if supported
+    pc = patchcore.patchcore.PatchCore(device)
+
+    # バージョン差異を吸収して load_from_path を呼ぶ
+    if not hasattr(pc, "load_from_path"):
+        raise RuntimeError("PatchCore instance has no load_from_path(). Your patchcore version differs.")
+
+    fn = pc.load_from_path
     try:
-        pc.model.eval()
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        kwargs = {}
+
+        # 必須 or よくある引数名
+        if "device" in params:
+            kwargs["device"] = device
+        if "nn_method" in params:
+            kwargs["nn_method"] = nn_method
+        if "faiss_nn" in params:
+            kwargs["faiss_nn"] = nn_method  # 念のため別名対応
+
+        fn(model_dir, **kwargs)
+        return pc
+    except TypeError:
+        # 最後の砦：位置引数で
+        try:
+            fn(model_dir, device, nn_method)
+            return pc
+        except TypeError as e:
+            raise RuntimeError(
+                f"load_from_path call failed due to signature mismatch.\n"
+                f"model_dir={model_dir}\n"
+                f"device={device}\n"
+                f"nn_method={type(nn_method)}\n"
+                f"error={e}"
+            )
+
+
+def benchmark_predict(
+    pc,
+    dataloader,
+    repeat: int,
+    warmup: int,
+    use_cuda_sync: bool,
+):
+    times = []
+    total_images = 0
+    # Subset の場合 len(dataloader.dataset) が取れないことがあるので安全に
+    try:
+        total_images = len(dataloader.dataset)
     except Exception:
-        pass
+        total_images = None
 
-    # GPU sync before starting
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-
+    # 実測
     for i in range(repeat):
+        if use_cuda_sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         t0 = time.perf_counter()
 
-        # ---- inference ----
+        # PatchCore 推論（スコア/セグメンテーションなどを内部計算）
         _scores, _segs, _labels_gt, _masks_gt = pc.predict(dataloader)
 
-        # ---- sync to include actual GPU time ----
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        if use_cuda_sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         t1 = time.perf_counter()
-        dt_ms = (t1 - t0) * 1000.0
+        dt = t1 - t0
 
         if i >= warmup:
-            times_ms.append(dt_ms)
+            times.append(dt)
 
-        print(f"[{i+1:03d}/{repeat}] infer time = {dt_ms:.3f} ms"
-              + ("" if i >= warmup else " (warmup)"))
+        LOGGER.info("Iter %d/%d: %.4f sec%s", i + 1, repeat, dt, " (warmup)" if i < warmup else "")
 
-    times_ms = np.asarray(times_ms, dtype=np.float64)
-    mean_ms = float(times_ms.mean()) if times_ms.size else float("nan")
-    std_ms = float(times_ms.std(ddof=1)) if times_ms.size > 1 else 0.0
-    return mean_ms, std_ms, times_ms
+    times = np.array(times, dtype=np.float64)
+    return times, total_images
+
+
+def parse_args():
+    ap = argparse.ArgumentParser("PatchCore inference-only benchmark (repeat/warmup, CUDA sync).")
+    ap.add_argument("--model_dir", type=str, required=True,
+                    help="PatchCore saved model directory (folder containing patchcore_params.pkl etc.)")
+    ap.add_argument("--dataset", type=str, default="mvtec", choices=list(_DATASETS.keys()))
+    ap.add_argument("--data_path", type=str, required=True, help="Dataset root path (mvtec-style).")
+    ap.add_argument("--subdataset", "-d", type=str, required=True, help="Class name, e.g., safe_pose")
+    ap.add_argument("--gpu", type=int, default=0, help="GPU id. Set -1 for CPU.")
+    ap.add_argument("--seed", type=int, default=0)
+
+    ap.add_argument("--batch_size", type=int, default=1)
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--resize", type=int, default=384)
+    ap.add_argument("--imagesize", type=int, default=384)
+    ap.add_argument("--limit_images", type=int, default=1,
+                    help="Use only first N test images for a light benchmark. 0 means use all test images (can be slow).")
+
+    ap.add_argument("--repeat", type=int, default=105)
+    ap.add_argument("--warmup", type=int, default=5)
+    ap.add_argument("--no_cuda_sync", action="store_true",
+                    help="Disable torch.cuda.synchronize() around timing (not recommended if you want accurate GPU timing).")
+
+    ap.add_argument("--faiss_num_workers", type=int, default=8)
+    ap.add_argument("--faiss_use_gpu", action="store_true",
+                    help="Try to use FAISS GPU (often not recommended for stable speed). Default: CPU FAISS.")
+    return ap.parse_args()
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
 
-    model_dir = Path(args.model_dir)
-    if not model_dir.exists():
-        raise FileNotFoundError(f"--model_dir not found: {model_dir}")
+    LOGGER.info("repeat=%d, warmup=%d", args.repeat, args.warmup)
+    LOGGER.info("batch_size=%d, num_workers=%d", args.batch_size, args.num_workers)
+    LOGGER.info("resize=%d, imagesize=%d, limit_images=%d", args.resize, args.imagesize, args.limit_images)
+    LOGGER.info("faiss_use_gpu=%s, faiss_num_workers=%d", args.faiss_use_gpu, args.faiss_num_workers)
 
-    # device
+    patchcore.utils.fix_seeds(args.seed)
+
+    # Device
     if args.gpu >= 0 and torch.cuda.is_available():
-        device = patchcore.utils.set_torch_device([args.gpu])
+        device = torch.device(f"cuda:{args.gpu}")
+        device_context = torch.cuda.device(device)
     else:
         device = torch.device("cpu")
+        device_context = contextlib.suppress()
 
-    print("=== PatchCore inference-only benchmark ===")
-    print(f"model_dir : {model_dir}")
-    print(f"data_path : {args.data_path}")
-    print(f"subdataset: {args.subdataset}")
-    print(f"device    : {device}")
-    print(f"repeat    : {args.repeat}, warmup={args.warmup}")
-    print(f"batch_size: {args.batch_size}, num_workers={args.num_workers}")
-    print(f"resize    : {args.resize}, imagesize={args.imagesize}")
-    print(f"faiss_on_gpu={args.faiss_on_gpu}, faiss_num_workers={args.faiss_num_workers}")
-    print("=========================================")
+    # FAISS NN method (version-safe)
+    nn_method = make_faiss_nn(use_gpu=args.faiss_use_gpu, num_workers=args.faiss_num_workers)
 
-    # nn_method is required by your PatchCore.load_from_path() signature
-    nn_method = patchcore.common.FaissNN(
-        faiss_on_gpu=bool(args.faiss_on_gpu),
-        faiss_num_workers=int(args.faiss_num_workers),
-    )
+    # Load model
+    if not os.path.isdir(args.model_dir):
+        raise FileNotFoundError(f"--model_dir not found or not a directory: {args.model_dir}")
+    with device_context:
+        pc = load_patchcore_model(args.model_dir, device=device, nn_method=nn_method)
 
-    # load patchcore instance
-    pc = patchcore.patchcore.PatchCore(device)
-    # IMPORTANT: your env requires (path, device, nn_method)
-    pc.load_from_path(str(model_dir), device, nn_method)
-
-    # dataloader (test split only)
-    test_loader = make_test_dataloader(
+    # Build dataloader
+    test_loader = build_test_dataloader(
+        dataset_name=args.dataset,
         data_path=args.data_path,
-        classname=args.subdataset,
+        subdataset=args.subdataset,
         resize=args.resize,
         imagesize=args.imagesize,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        seed=0,
+        seed=args.seed,
+        limit_images=args.limit_images,
     )
 
-    # benchmark
-    mean_ms, std_ms, times_ms = benchmark_inference(
-        pc=pc,
-        dataloader=test_loader,
-        repeat=args.repeat,
-        warmup=args.warmup,
-        device=device if isinstance(device, torch.device) else device,
-    )
+    # Benchmark
+    with device_context:
+        times, n_imgs = benchmark_predict(
+            pc,
+            test_loader,
+            repeat=args.repeat,
+            warmup=args.warmup,
+            use_cuda_sync=(not args.no_cuda_sync),
+        )
 
-    n = len(times_ms)
-    print("\n=== Result ===")
-    print(f"used_iters: {n}  (repeat={args.repeat} - warmup={args.warmup})")
-    print(f"mean_ms   : {mean_ms:.3f} ms  (per full test-set pass)")
-    print(f"std_ms    : {std_ms:.3f} ms")
-    if n > 0:
-        p50 = float(np.percentile(times_ms, 50))
-        p90 = float(np.percentile(times_ms, 90))
-        p95 = float(np.percentile(times_ms, 95))
-        print(f"p50/p90/p95: {p50:.3f} / {p90:.3f} / {p95:.3f} ms")
-    print("=============\n")
+    # Report
+    mean_s = float(times.mean()) if len(times) else float("nan")
+    std_s = float(times.std(ddof=1)) if len(times) > 1 else 0.0
+    min_s = float(times.min()) if len(times) else float("nan")
+    max_s = float(times.max()) if len(times) else float("nan")
+
+    LOGGER.info("==== RESULT ====")
+    LOGGER.info("valid_runs=%d (repeat=%d - warmup=%d)", len(times), args.repeat, args.warmup)
+    LOGGER.info("mean=%.6f sec, std=%.6f sec, min=%.6f sec, max=%.6f sec", mean_s, std_s, min_s, max_s)
+
+    if n_imgs is not None and n_imgs > 0:
+        LOGGER.info("per_image_mean=%.6f sec/img  (n_imgs=%d in one predict pass)", mean_s / n_imgs, n_imgs)
+
+    print("\n--- SUMMARY ---")
+    print(f"mean_sec={mean_s:.6f}")
+    print(f"std_sec={std_s:.6f}")
+    print(f"min_sec={min_s:.6f}")
+    print(f"max_sec={max_s:.6f}")
+    if n_imgs is not None and n_imgs > 0:
+        print(f"per_image_mean_sec={mean_s / n_imgs:.6f}  (n_imgs={n_imgs})")
 
 
 if __name__ == "__main__":
     main()
+
