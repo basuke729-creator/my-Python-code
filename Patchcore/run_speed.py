@@ -102,6 +102,28 @@ def _cuda_sync_if_needed(device):
         torch.cuda.synchronize(device=device)
 
 
+def _resolve_model_dir(path: str) -> str:
+    """
+    ユーザーが
+      - .../models/<dataset_name>
+      - .../models/<dataset_name>/patchcore_params.pkl
+    のどちらを渡しても、最終的に「モデルディレクトリ」を返す。
+    """
+    if path is None:
+        raise click.ClickException("--load_model_path が必要です（学習スキップする場合）")
+
+    p = os.path.expanduser(path)
+    p = os.path.abspath(p)
+
+    if os.path.isdir(p):
+        return p
+
+    if os.path.isfile(p):
+        return os.path.dirname(p)
+
+    raise click.ClickException(f"指定されたモデルパスが存在しません: {p}")
+
+
 def _benchmark_patchcore_infer_fps(
     PatchCore_list,
     dataloader_single,
@@ -110,23 +132,17 @@ def _benchmark_patchcore_infer_fps(
     bench_warmup: int = 5,
 ):
     """
-    推論のみのFPSを測定する（GPU同期あり）。
-    - 1回の計測 = アンサンブル全体の predict + normalize + mean まで（あなたの現状推論と一致）
-    - bench_iters 回回して、最初 bench_warmup 回を捨て、残りの平均からFPS算出
+    推論のみFPS測定（GPU同期あり）
+    - 1回 = PatchCore.predict + アンサンブル正規化まで（現状の推論パイプライン一致）
+    - 105回回して最初5回捨て、残り100回平均
     """
     assert bench_iters > bench_warmup, "bench_iters must be > bench_warmup"
 
-    # できるだけ推論を安定化（任意だが一般に有効）
-    # 既に公式側でevalにしている可能性はあるが害は少ない
     torch.backends.cudnn.benchmark = True
 
     times = []
 
-    # 事前にキャッシュを空にしたい場合（任意）
-    # torch.cuda.empty_cache()
-
     for it in range(bench_iters):
-        # --- 計測範囲開始（GPUを含め正確に） ---
         _cuda_sync_if_needed(device)
         t0 = time.perf_counter()
 
@@ -160,22 +176,19 @@ def _benchmark_patchcore_infer_fps(
         segmentations = (segmentations - min_scores) / (max_scores - min_scores + 1e-12)
         segmentations = np.mean(segmentations, axis=0)
 
-        # --- 計測範囲終了 ---
         _cuda_sync_if_needed(device)
         t1 = time.perf_counter()
 
         dt = t1 - t0
         times.append(dt)
 
-        # 軽いログ（邪魔なら消してOK）
         if it < bench_warmup:
             LOGGER.info("[BENCH] warmup %d/%d: %.3f ms", it + 1, bench_warmup, dt * 1000.0)
 
-    kept = np.array(times[bench_warmup:], dtype=np.float64)  # 100回分
+    kept = np.array(times[bench_warmup:], dtype=np.float64)
     mean_s = float(kept.mean())
     fps = 1.0 / mean_s if mean_s > 0 else float("inf")
 
-    # 追加で分布を見る（不要なら消してOK）
     p50 = float(np.percentile(kept, 50) * 1000.0)
     p95 = float(np.percentile(kept, 95) * 1000.0)
 
@@ -196,11 +209,16 @@ def _benchmark_patchcore_infer_fps(
 @click.option("--log_project", type=str, default="project")
 @click.option("--save_segmentation_images", is_flag=True, help="ヒートマップ(セグメンテーション画像)を保存する")
 @click.option("--save_patchcore_model", is_flag=True)
-# ===== 追加: 速度計測モード =====
+# ===== 追加: 推論FPS測定 =====
 @click.option("--benchmark_fps", is_flag=True, help="推論のみのFPS計測モード（105回-最初5回捨てて平均FPS）")
 @click.option("--bench_iters", type=int, default=105, show_default=True, help="推論の総回数")
 @click.option("--bench_warmup", type=int, default=5, show_default=True, help="捨てるウォームアップ回数")
-@click.option("--bench_image_index", type=int, default=0, show_default=True, help="テストセットから使う画像のindex（1枚で回す）")
+@click.option("--bench_image_index", type=int, default=0, show_default=True, help="テストセットから使う画像index（1枚で回す）")
+# ===== 追加: 学習スキップして保存済みモデルをロード =====
+@click.option("--load_model_path", type=str, default=None,
+              help="保存済みモデルのパス。ディレクトリ or patchcore_params.pkl を指定可（例: .../models/mvtec_safe_pose  または .../patchcore_params.pkl）")
+@click.option("--skip_training", is_flag=True,
+              help="学習(fit)をスキップして load_model_path からロードする")
 def main(**kwargs):
     pass
 
@@ -219,6 +237,8 @@ def run(
     bench_iters,
     bench_warmup,
     bench_image_index,
+    load_model_path,
+    skip_training,
 ):
     methods = {key: item for (key, item) in methods}
 
@@ -257,37 +277,43 @@ def run(
             PatchCore_list = methods["get_patchcore"](imagesize, sampler, device)
 
             if len(PatchCore_list) > 1:
-                LOGGER.info(
-                    "Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list))
-                )
+                LOGGER.info("Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list)))
 
-            # ===== train =====
+            # ===== train or load =====
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
-                if PatchCore.backbone.seed is not None:
-                    patchcore.utils.fix_seeds(PatchCore.backbone.seed, device)
-                LOGGER.info("Training models ({}/{})".format(i + 1, len(PatchCore_list)))
-                PatchCore.fit(dataloaders["training"])
+
+                if skip_training:
+                    model_dir = _resolve_model_dir(load_model_path)
+                    # 念のため、最低限のファイル存在チェック（公式保存の一例）
+                    pkl_path = os.path.join(model_dir, "patchcore_params.pkl")
+                    if not os.path.exists(pkl_path):
+                        LOGGER.warning("patchcore_params.pkl が見つかりません: %s", pkl_path)
+                        LOGGER.warning("それでも load_from_path を試みます（保存形式が異なる可能性）")
+
+                    LOGGER.info("Loading PatchCore model ({}/{}) from: %s".format(i + 1, len(PatchCore_list)), model_dir)
+                    PatchCore.load_from_path(model_dir)
+                else:
+                    if PatchCore.backbone.seed is not None:
+                        patchcore.utils.fix_seeds(PatchCore.backbone.seed, device)
+                    LOGGER.info("Training models ({}/{})".format(i + 1, len(PatchCore_list)))
+                    PatchCore.fit(dataloaders["training"])
 
             # ===== benchmark inference only =====
             if benchmark_fps:
-                # 計測は「1枚画像」を対象（index指定）
                 test_dataset = dataloaders["testing"].dataset
                 n_test = len(test_dataset)
-
                 if n_test <= 0:
                     raise RuntimeError("Testing dataset is empty; cannot benchmark.")
 
                 idx = int(bench_image_index) % n_test
                 subset = torch.utils.data.Subset(test_dataset, [idx])
 
-                # 速度計測は DataLoader 側の揺れを減らす（num_workers=0推奨）
-                # batch_size=1で「1枚あたりFPS」を正確に
                 dataloader_single = torch.utils.data.DataLoader(
                     subset,
                     batch_size=1,
                     shuffle=False,
-                    num_workers=0,
+                    num_workers=0,   # 揺れを減らす
                     pin_memory=True,
                 )
 
@@ -308,11 +334,9 @@ def run(
                 LOGGER.info("[BENCH] FPS : %.2f", stats["fps"])
                 LOGGER.info("[BENCH] p50 : %.3f ms, p95 : %.3f ms (n=%d)",
                             stats["p50_ms"], stats["p95_ms"], stats["n_kept"])
-
-                # ベンチ時はここで終了（画像保存・混同行列・結果保存など “全部やらない”）
                 LOGGER.info("[BENCH] Done. (Skipped metrics/plots/sorting/model-save/final-results)")
                 LOGGER.info("\n\n-----\n")
-                continue
+                continue  # ベンチ時はここで終了（不要処理を完全に通らない）
 
             # ===== infer (test) =====
             torch.cuda.empty_cache()
@@ -320,14 +344,8 @@ def run(
 
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
-                LOGGER.info(
-                    "Embedding test data with models ({}/{})".format(
-                        i + 1, len(PatchCore_list)
-                    )
-                )
-                scores, segmentations, labels_gt, masks_gt = PatchCore.predict(
-                    dataloaders["testing"]
-                )
+                LOGGER.info("Embedding test data with models ({}/{})".format(i + 1, len(PatchCore_list)))
+                scores, segmentations, labels_gt, masks_gt = PatchCore.predict(dataloaders["testing"])
                 aggregator["scores"].append(scores)
                 aggregator["segmentations"].append(segmentations)
 
@@ -352,12 +370,9 @@ def run(
             segmentations = (segmentations - min_scores) / (max_scores - min_scores + 1e-12)
             segmentations = np.mean(segmentations, axis=0)
 
-            # True label（"good" 以外を異常扱い）
-            anomaly_labels = [
-                x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
-            ]
+            anomaly_labels = [x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate]
 
-            # ===== heatmap / segmentation_images =====
+            # ===== heatmap =====
             if save_segmentation_images:
                 image_paths = [x[2] for x in dataloaders["testing"].dataset.data_to_iterate]
                 mask_paths = [x[3] for x in dataloaders["testing"].dataset.data_to_iterate]
@@ -382,16 +397,14 @@ def run(
                             img = (img - mn) / (mx - mn)
 
                     img = np.clip(img, 0.0, 1.0)
-                    img = (img * 255.0).astype(np.uint8)     # CHW
-                    img = np.transpose(img, (1, 2, 0))       # HWC
+                    img = (img * 255.0).astype(np.uint8)
+                    img = np.transpose(img, (1, 2, 0))
                     return img
 
                 def mask_transform(mask):
                     return dataloaders["testing"].dataset.transform_mask(mask).numpy()
 
-                image_save_path = os.path.join(
-                    run_save_path, "segmentation_images", dataset_name
-                )
+                image_save_path = os.path.join(run_save_path, "segmentation_images", dataset_name)
                 os.makedirs(image_save_path, exist_ok=True)
 
                 patchcore.utils.plot_segmentation_images(
@@ -407,14 +420,10 @@ def run(
 
             # ===== metrics =====
             LOGGER.info("Computing evaluation metrics.")
-            image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(
-                scores, anomaly_labels
-            )
+            image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(scores, anomaly_labels)
             auroc = image_metrics["auroc"]
 
-            pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(
-                segmentations, masks_gt
-            )
+            pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(segmentations, masks_gt)
             full_pixel_auroc = pixel_scores["auroc"]
 
             sel_idxs = [i for i in range(len(masks_gt)) if np.sum(masks_gt[i]) > 0]
@@ -442,10 +451,7 @@ def run(
             # ===== confusion matrix =====
             class_names = ["normal", "abnormal"]
             y_true = np.asarray(anomaly_labels, dtype=int)
-
-            threshold = image_metrics.get(
-                "optimal_threshold", float(np.percentile(scores, 95.0))
-            )
+            threshold = image_metrics.get("optimal_threshold", float(np.percentile(scores, 95.0)))
             y_pred = (scores >= threshold).astype(int)
 
             cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
@@ -486,7 +492,6 @@ def run(
         LOGGER.info("\n\n-----\n")
 
     # ===== save final results =====
-    # ※ベンチ専用モードでは continue で抜けるのでここは実行されない
     if len(result_collect) > 0:
         result_metric_names = list(result_collect[-1].keys())[1:]
         result_dataset_names = [results["dataset_name"] for results in result_collect]
@@ -540,14 +545,10 @@ def patch_core(
 
     def get_patchcore(input_shape, sampler, device):
         loaded_patchcores = []
-        for backbone_name, layers_to_extract_from in zip(
-            backbone_names, layers_to_extract_from_coll
-        ):
+        for backbone_name, layers_to_extract_from in zip(backbone_names, layers_to_extract_from_coll):
             backbone_seed = None
             if ".seed-" in backbone_name:
-                backbone_name, backbone_seed = backbone_name.split(".seed-")[0], int(
-                    backbone_name.split("-")[-1]
-                )
+                backbone_name, backbone_seed = backbone_name.split(".seed-")[0], int(backbone_name.split("-")[-1])
 
             backbone = patchcore.backbones.load(backbone_name)
             backbone.name, backbone.seed = backbone_name, backbone_seed
@@ -691,3 +692,4 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     LOGGER.info("Command line arguments: {}".format(" ".join(sys.argv)))
     main()
+

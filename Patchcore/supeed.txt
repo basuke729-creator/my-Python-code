@@ -1,15 +1,13 @@
-#!/usr/bin/env bash
-
-cd "$(dirname "$0")"
-
 export PYTHONPATH=src
 datapath="/home/yamamao/patchcore_git/datasets/pose_dataset"
 
 python bin/run_patchcore.py \
   --gpu 0 \
   --seed 0 \
-  --log_group safe_pose_benchmark \
+  --log_group safe_pose_bench \
   --log_project pose_results \
+  --skip_training \
+  --load_model_path "/home/yamamao/patchcore_git/patchcore-inspection/results/pose_results/safe_pose_train_24/models/mvtec_safe_pose/patchcore_params.pkl" \
   --benchmark_fps \
   --bench_iters 105 \
   --bench_warmup 5 \
@@ -17,15 +15,13 @@ python bin/run_patchcore.py \
   results \
   patch_core \
     -b wideresnet50 \
-    -le layer2 \
-    -le layer3 \
+    -le layer2 -le layer3 \
     --pretrain_embed_dimension 1024 \
     --target_embed_dimension 1024 \
     --anomaly_scorer_num_nn 10 \
     --patchsize 5 \
   sampler \
-    approx_greedy_coreset \
-    -p 0.1 \
+    approx_greedy_coreset -p 0.1 \
   dataset \
     mvtec "$datapath" \
     -d safe_pose
