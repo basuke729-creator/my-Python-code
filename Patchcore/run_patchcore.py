@@ -26,7 +26,7 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     """枚数ベース＋行正規化(%)の混同行列を保存する（どちらもBlues）。"""
     os.makedirs(save_dir, exist_ok=True)
 
-    # ===== 枚数ベース（counts）=====
+    # ===== counts =====
     fig, ax = plt.subplots()
     im = ax.imshow(cm, vmin=0, vmax=max(1, cm.max()), cmap="Blues")
     ax.set_xticks(range(len(class_names)))
@@ -54,10 +54,15 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     fig.savefig(count_path, bbox_inches="tight", dpi=200)
     plt.close(fig)
 
-    # ===== 行方向で正規化(%) =====
+    # ===== row-normalized (%) =====
     with np.errstate(divide="ignore", invalid="ignore"):
         denom = cm.sum(axis=1, keepdims=True)
-        cm_norm = np.divide(cm.astype(np.float32), denom, out=np.zeros_like(cm, dtype=np.float32), where=(denom != 0))
+        cm_norm = np.divide(
+            cm.astype(np.float32),
+            denom,
+            out=np.zeros_like(cm, dtype=np.float32),
+            where=(denom != 0),
+        )
 
     fig, ax = plt.subplots()
     im = ax.imshow(cm_norm, vmin=0.0, vmax=1.0, cmap="Blues")
@@ -151,9 +156,11 @@ def run(
             PatchCore_list = methods["get_patchcore"](imagesize, sampler, device)
 
             if len(PatchCore_list) > 1:
-                LOGGER.info("Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list)))
+                LOGGER.info(
+                    "Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list))
+                )
 
-            # ===== 学習 =====
+            # ===== train =====
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
                 if PatchCore.backbone.seed is not None:
@@ -161,18 +168,24 @@ def run(
                 LOGGER.info("Training models ({}/{})".format(i + 1, len(PatchCore_list)))
                 PatchCore.fit(dataloaders["training"])
 
-            # ===== 推論（test）=====
+            # ===== infer (test) =====
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
 
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
-                LOGGER.info("Embedding test data with models ({}/{})".format(i + 1, len(PatchCore_list)))
-                scores, segmentations, labels_gt, masks_gt = PatchCore.predict(dataloaders["testing"])
+                LOGGER.info(
+                    "Embedding test data with models ({}/{})".format(
+                        i + 1, len(PatchCore_list)
+                    )
+                )
+                scores, segmentations, labels_gt, masks_gt = PatchCore.predict(
+                    dataloaders["testing"]
+                )
                 aggregator["scores"].append(scores)
                 aggregator["segmentations"].append(segmentations)
 
-            # ===== Ensemble 正規化（元の公式処理に合わせる）=====
+            # ===== ensemble normalize (official-like) =====
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
@@ -198,22 +211,50 @@ def run(
                 x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
             ]
 
-            # ===== ヒートマップ可視化（segmentation_images）=====
+            # ===== heatmap / segmentation_images =====
             if save_segmentation_images:
                 image_paths = [x[2] for x in dataloaders["testing"].dataset.data_to_iterate]
                 mask_paths = [x[3] for x in dataloaders["testing"].dataset.data_to_iterate]
 
+                # ★ここが修正版（transform_mean/std が無くても落ちない）
                 def image_transform(image):
-                    in_std = np.array(dataloaders["testing"].dataset.transform_std).reshape(-1, 1, 1)
-                    in_mean = np.array(dataloaders["testing"].dataset.transform_mean).reshape(-1, 1, 1)
-                    image = dataloaders["testing"].dataset.transform_img(image)
-                    return np.clip((image.numpy() * in_std + in_mean) * 255, 0, 255).astype(np.uint8)
+                    ds = dataloaders["testing"].dataset
+
+                    # datasetの transform_img を使って Tensor(CHW) にする
+                    img = ds.transform_img(image)
+                    if hasattr(img, "detach"):
+                        img = img.detach()
+                    img = img.cpu().numpy()  # CHW
+
+                    # mean/std があれば逆正規化、無ければそのまま
+                    mean = getattr(ds, "transform_mean", None)
+                    std = getattr(ds, "transform_std", None)
+                    if mean is not None and std is not None:
+                        mean = np.array(mean, dtype=np.float32).reshape(-1, 1, 1)
+                        std = np.array(std, dtype=np.float32).reshape(-1, 1, 1)
+                        img = img * std + mean
+
+                    # 0-1に寄せる（想定外の範囲ならmin-maxで可視化）
+                    if img.max() > 1.5 or img.min() < -0.5:
+                        mn, mx = float(img.min()), float(img.max())
+                        if mx > mn:
+                            img = (img - mn) / (mx - mn)
+
+                    img = np.clip(img, 0.0, 1.0)
+
+                    # uint8 HWC へ
+                    img = (img * 255.0).astype(np.uint8)     # CHW
+                    img = np.transpose(img, (1, 2, 0))       # HWC
+                    return img
 
                 def mask_transform(mask):
                     return dataloaders["testing"].dataset.transform_mask(mask).numpy()
 
-                image_save_path = os.path.join(run_save_path, "segmentation_images", dataset_name)
+                image_save_path = os.path.join(
+                    run_save_path, "segmentation_images", dataset_name
+                )
                 os.makedirs(image_save_path, exist_ok=True)
+
                 patchcore.utils.plot_segmentation_images(
                     image_save_path,
                     image_paths,
@@ -225,12 +266,16 @@ def run(
                 )
                 LOGGER.info("Saved segmentation/heatmap images to: %s", image_save_path)
 
-            # ===== 評価指標 =====
+            # ===== metrics =====
             LOGGER.info("Computing evaluation metrics.")
-            image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(scores, anomaly_labels)
+            image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(
+                scores, anomaly_labels
+            )
             auroc = image_metrics["auroc"]
 
-            pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(segmentations, masks_gt)
+            pixel_scores = patchcore.metrics.compute_pixelwise_retrieval_metrics(
+                segmentations, masks_gt
+            )
             full_pixel_auroc = pixel_scores["auroc"]
 
             sel_idxs = [i for i in range(len(masks_gt)) if np.sum(masks_gt[i]) > 0]
@@ -255,19 +300,20 @@ def run(
                 if key != "dataset_name":
                     LOGGER.info("{0}: {1:3.3f}".format(key, item))
 
-            # ===== 混同行列 =====
+            # ===== confusion matrix =====
             class_names = ["normal", "abnormal"]
             y_true = np.asarray(anomaly_labels, dtype=int)
 
-            # しきい値：metrics に optimal_threshold があればそれ、なければ95%tile
-            threshold = image_metrics.get("optimal_threshold", float(np.percentile(scores, 95.0)))
+            threshold = image_metrics.get(
+                "optimal_threshold", float(np.percentile(scores, 95.0))
+            )
             y_pred = (scores >= threshold).astype(int)
 
             cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
             cm_save_dir = os.path.join(run_save_path, "confusion_matrices")
             plot_confusion_matrices(cm, class_names, cm_save_dir, dataset_name)
 
-            # ===== テスト画像を normal / abnormal に仕分けコピー =====
+            # ===== sort copy test images =====
             sorted_base = os.path.join(run_save_path, "sorted_images", dataset_name)
             normal_dir = os.path.join(sorted_base, "normal")
             abnormal_dir = os.path.join(sorted_base, "abnormal")
@@ -286,7 +332,7 @@ def run(
 
             LOGGER.info("Saved sorted images to: %s", sorted_base)
 
-            # ===== PatchCore モデル保存 =====
+            # ===== save model =====
             if save_patchcore_model:
                 patchcore_save_path = os.path.join(run_save_path, "models", dataset_name)
                 os.makedirs(patchcore_save_path, exist_ok=True)
@@ -300,7 +346,7 @@ def run(
 
         LOGGER.info("\n\n-----\n")
 
-    # ===== 全データセット結果をCSVに保存 =====
+    # ===== save final results =====
     result_metric_names = list(result_collect[-1].keys())[1:]
     result_dataset_names = [results["dataset_name"] for results in result_collect]
     result_scores = [list(results.values())[1:] for results in result_collect]
@@ -353,10 +399,14 @@ def patch_core(
 
     def get_patchcore(input_shape, sampler, device):
         loaded_patchcores = []
-        for backbone_name, layers_to_extract_from in zip(backbone_names, layers_to_extract_from_coll):
+        for backbone_name, layers_to_extract_from in zip(
+            backbone_names, layers_to_extract_from_coll
+        ):
             backbone_seed = None
             if ".seed-" in backbone_name:
-                backbone_name, backbone_seed = backbone_name.split(".seed-")[0], int(backbone_name.split("-")[-1])
+                backbone_name, backbone_seed = backbone_name.split(".seed-")[0], int(
+                    backbone_name.split("-")[-1]
+                )
 
             backbone = patchcore.backbones.load(backbone_name)
             backbone.name, backbone.seed = backbone_name, backbone_seed
@@ -484,7 +534,11 @@ def dataset(
             else:
                 val_dataloader = None
 
-            dataloader_dict = {"training": train_dataloader, "validation": val_dataloader, "testing": test_dataloader}
+            dataloader_dict = {
+                "training": train_dataloader,
+                "validation": val_dataloader,
+                "testing": test_dataloader,
+            }
             dataloaders.append(dataloader_dict)
         return dataloaders
 
