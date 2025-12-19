@@ -2,40 +2,22 @@
 set -e
 
 cd "$(dirname "$0")"
+
+# venv
+source /home/yamamao/patchcore_git/corevenv/bin/activate
 export PYTHONPATH=src
 
-DATAPATH="/home/yamamaoo/patchcore_git/datasets/pose_dataset"
-MODEL_DIR="/home/yamamaoo/patchcore_git/patchcore-inspection/results/pose_results/safe_pose_train_24/models/mvtec_safe_pose"
+MODEL_DIR="/home/yamamao/patchcore_git/patchcore-inspection/results/pose_results/safe_pose_train_24/models/mvtec_safe_pose"
+DATA_PATH="/home/yamamao/patchcore_git/datasets/pose_dataset"
 
-python - <<EOF
-import torch
-import patchcore.patchcore
-import patchcore.backbones
-import patchcore.common
-import patchcore.datasets.mvtec as mvtec
-from run_patchcore_infer_only import benchmark_inference
-
-device = torch.device("cuda:0")
-
-# Dataset（testのみ）
-dataset = mvtec.MVTecDataset(
-    "${DATAPATH}",
-    classname="safe_pose",
-    split=mvtec.DatasetSplit.TEST,
-    resize=384,
-    imagesize=384,
-)
-dataloader = torch.utils.data.DataLoader(
-    dataset,
-    batch_size=1,
-    shuffle=False,
-    num_workers=4,
-    pin_memory=True,
-)
-
-# PatchCore 復元
-pc = patchcore.patchcore.PatchCore(device)
-pc.load_from_path("${MODEL_DIR}")
-
-benchmark_inference(pc, dataloader)
-EOF
+python run_patchcore_infer_only.py \
+  --model_dir "$MODEL_DIR" \
+  --data_path "$DATA_PATH" \
+  --subdataset safe_pose \
+  --gpu 0 \
+  --batch_size 1 \
+  --num_workers 4 \
+  --resize 384 \
+  --imagesize 384 \
+  --repeat 105 \
+  --warmup 5
