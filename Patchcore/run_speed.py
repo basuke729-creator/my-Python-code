@@ -1,14 +1,15 @@
 import contextlib
+import inspect
 import logging
 import os
-import sys
 import shutil
+import sys
 import time
 
 import click
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
 
 import patchcore.backbones
@@ -24,10 +25,8 @@ _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
 
 
 def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
-    """枚数ベース＋行正規化(%)の混同行列を保存する（どちらもBlues）。"""
     os.makedirs(save_dir, exist_ok=True)
 
-    # ===== counts =====
     fig, ax = plt.subplots()
     im = ax.imshow(cm, vmin=0, vmax=max(1, cm.max()), cmap="Blues")
     ax.set_xticks(range(len(class_names)))
@@ -55,7 +54,6 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     fig.savefig(count_path, bbox_inches="tight", dpi=200)
     plt.close(fig)
 
-    # ===== row-normalized (%) =====
     with np.errstate(divide="ignore", invalid="ignore"):
         denom = cm.sum(axis=1, keepdims=True)
         cm_norm = np.divide(
@@ -97,46 +95,51 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     LOGGER.info("  norm  : %s", norm_path)
 
 
-def _cuda_sync_if_needed(device):
+def _cuda_sync_if_needed(device: torch.device):
     if device.type.lower().startswith("cuda"):
         torch.cuda.synchronize(device=device)
 
 
 def _resolve_model_dir(path: str) -> str:
-    """
-    ユーザーが
-      - .../models/<dataset_name>
-      - .../models/<dataset_name>/patchcore_params.pkl
-    のどちらを渡しても、最終的に「モデルディレクトリ」を返す。
-    """
     if path is None:
-        raise click.ClickException("--load_model_path が必要です（学習スキップする場合）")
-
-    p = os.path.expanduser(path)
-    p = os.path.abspath(p)
-
+        raise click.ClickException("--load_model_path is required when --skip_training is used.")
+    p = os.path.abspath(os.path.expanduser(path))
     if os.path.isdir(p):
         return p
-
     if os.path.isfile(p):
         return os.path.dirname(p)
+    raise click.ClickException(f"Model path does not exist: {p}")
 
-    raise click.ClickException(f"指定されたモデルパスが存在しません: {p}")
+
+def _load_from_path_compat(patchcore_obj, model_dir: str, device: torch.device, nn_method):
+    fn = patchcore_obj.load_from_path
+    sig = inspect.signature(fn)
+    param_names = list(sig.parameters.keys())
+
+    kwargs = {}
+    if "device" in param_names:
+        kwargs["device"] = device
+    if "nn_method" in param_names:
+        kwargs["nn_method"] = nn_method
+
+    if kwargs:
+        return fn(model_dir, **kwargs)
+
+    try:
+        return fn(model_dir, device, nn_method)
+    except TypeError:
+        return fn(model_dir)
 
 
 def _benchmark_patchcore_infer_fps(
     PatchCore_list,
     dataloader_single,
-    device,
+    device: torch.device,
     bench_iters: int = 105,
     bench_warmup: int = 5,
 ):
-    """
-    推論のみFPS測定（GPU同期あり）
-    - 1回 = PatchCore.predict + アンサンブル正規化まで（現状の推論パイプライン一致）
-    - 105回回して最初5回捨て、残り100回平均
-    """
-    assert bench_iters > bench_warmup, "bench_iters must be > bench_warmup"
+    if not (bench_iters > bench_warmup):
+        raise ValueError("bench_iters must be > bench_warmup")
 
     torch.backends.cudnn.benchmark = True
 
@@ -155,7 +158,6 @@ def _benchmark_patchcore_infer_fps(
             aggregator["scores"].append(scores)
             aggregator["segmentations"].append(segmentations)
 
-        # ===== ensemble normalize (official-like) =====
         scores = np.array(aggregator["scores"])
         min_scores = scores.min(axis=-1).reshape(-1, 1)
         max_scores = scores.max(axis=-1).reshape(-1, 1)
@@ -188,7 +190,6 @@ def _benchmark_patchcore_infer_fps(
     kept = np.array(times[bench_warmup:], dtype=np.float64)
     mean_s = float(kept.mean())
     fps = 1.0 / mean_s if mean_s > 0 else float("inf")
-
     p50 = float(np.percentile(kept, 50) * 1000.0)
     p95 = float(np.percentile(kept, 95) * 1000.0)
 
@@ -197,7 +198,7 @@ def _benchmark_patchcore_infer_fps(
         "fps": fps,
         "p50_ms": p50,
         "p95_ms": p95,
-        "n_kept": len(kept),
+        "n_kept": int(len(kept)),
     }
 
 
@@ -207,18 +208,14 @@ def _benchmark_patchcore_infer_fps(
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--log_group", type=str, default="group")
 @click.option("--log_project", type=str, default="project")
-@click.option("--save_segmentation_images", is_flag=True, help="ヒートマップ(セグメンテーション画像)を保存する")
+@click.option("--save_segmentation_images", is_flag=True)
 @click.option("--save_patchcore_model", is_flag=True)
-# ===== 追加: 推論FPS測定 =====
-@click.option("--benchmark_fps", is_flag=True, help="推論のみのFPS計測モード（105回-最初5回捨てて平均FPS）")
-@click.option("--bench_iters", type=int, default=105, show_default=True, help="推論の総回数")
-@click.option("--bench_warmup", type=int, default=5, show_default=True, help="捨てるウォームアップ回数")
-@click.option("--bench_image_index", type=int, default=0, show_default=True, help="テストセットから使う画像index（1枚で回す）")
-# ===== 追加: 学習スキップして保存済みモデルをロード =====
-@click.option("--load_model_path", type=str, default=None,
-              help="保存済みモデルのパス。ディレクトリ or patchcore_params.pkl を指定可（例: .../models/mvtec_safe_pose  または .../patchcore_params.pkl）")
-@click.option("--skip_training", is_flag=True,
-              help="学習(fit)をスキップして load_model_path からロードする")
+@click.option("--benchmark_fps", is_flag=True)
+@click.option("--bench_iters", type=int, default=105, show_default=True)
+@click.option("--bench_warmup", type=int, default=5, show_default=True)
+@click.option("--bench_image_index", type=int, default=0, show_default=True)
+@click.option("--load_model_path", type=str, default=None)
+@click.option("--skip_training", is_flag=True)
 def main(**kwargs):
     pass
 
@@ -259,11 +256,10 @@ def run(
 
     for dataloader_count, dataloaders in enumerate(list_of_dataloaders):
         LOGGER.info(
-            "Evaluating dataset [{}] ({}/{})...".format(
-                dataloaders["training"].name,
-                dataloader_count + 1,
-                len(list_of_dataloaders),
-            )
+            "Evaluating dataset [%s] (%d/%d)...",
+            dataloaders["training"].name,
+            dataloader_count + 1,
+            len(list_of_dataloaders),
         )
 
         patchcore.utils.fix_seeds(seed, device)
@@ -277,29 +273,26 @@ def run(
             PatchCore_list = methods["get_patchcore"](imagesize, sampler, device)
 
             if len(PatchCore_list) > 1:
-                LOGGER.info("Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list)))
+                LOGGER.info("Utilizing PatchCore Ensemble (N=%d).", len(PatchCore_list))
 
-            # ===== train or load =====
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
 
                 if skip_training:
                     model_dir = _resolve_model_dir(load_model_path)
-                    # 念のため、最低限のファイル存在チェック（公式保存の一例）
-                    pkl_path = os.path.join(model_dir, "patchcore_params.pkl")
-                    if not os.path.exists(pkl_path):
-                        LOGGER.warning("patchcore_params.pkl が見つかりません: %s", pkl_path)
-                        LOGGER.warning("それでも load_from_path を試みます（保存形式が異なる可能性）")
-
-                    LOGGER.info("Loading PatchCore model ({}/{}) from: %s".format(i + 1, len(PatchCore_list)), model_dir)
-                    PatchCore.load_from_path(model_dir)
+                    nn_method = getattr(PatchCore, "nn_method", None)
+                    if nn_method is None:
+                        raise click.ClickException(
+                            "nn_method not found on PatchCore instance. Ensure get_patchcore sets PatchCore.nn_method."
+                        )
+                    LOGGER.info("Loading model (%d/%d) from: %s", i + 1, len(PatchCore_list), model_dir)
+                    _load_from_path_compat(PatchCore, model_dir, device, nn_method)
                 else:
                     if PatchCore.backbone.seed is not None:
                         patchcore.utils.fix_seeds(PatchCore.backbone.seed, device)
-                    LOGGER.info("Training models ({}/{})".format(i + 1, len(PatchCore_list)))
+                    LOGGER.info("Training model (%d/%d)", i + 1, len(PatchCore_list))
                     PatchCore.fit(dataloaders["training"])
 
-            # ===== benchmark inference only =====
             if benchmark_fps:
                 test_dataset = dataloaders["testing"].dataset
                 n_test = len(test_dataset)
@@ -313,13 +306,17 @@ def run(
                     subset,
                     batch_size=1,
                     shuffle=False,
-                    num_workers=0,   # 揺れを減らす
+                    num_workers=0,
                     pin_memory=True,
                 )
 
                 LOGGER.info(
-                    "[BENCH] Start inference benchmark: iters=%d, warmup=%d, image_index=%d (test_size=%d), ensemble=%d",
-                    bench_iters, bench_warmup, idx, n_test, len(PatchCore_list)
+                    "[BENCH] Start: iters=%d warmup=%d image_index=%d test_size=%d ensemble=%d",
+                    bench_iters,
+                    bench_warmup,
+                    idx,
+                    n_test,
+                    len(PatchCore_list),
                 )
 
                 stats = _benchmark_patchcore_infer_fps(
@@ -332,24 +329,21 @@ def run(
 
                 LOGGER.info("[BENCH] mean: %.3f ms / image", stats["mean_ms"])
                 LOGGER.info("[BENCH] FPS : %.2f", stats["fps"])
-                LOGGER.info("[BENCH] p50 : %.3f ms, p95 : %.3f ms (n=%d)",
-                            stats["p50_ms"], stats["p95_ms"], stats["n_kept"])
-                LOGGER.info("[BENCH] Done. (Skipped metrics/plots/sorting/model-save/final-results)")
+                LOGGER.info("[BENCH] p50 : %.3f ms, p95 : %.3f ms (n=%d)", stats["p50_ms"], stats["p95_ms"], stats["n_kept"])
+                LOGGER.info("[BENCH] Done.")
                 LOGGER.info("\n\n-----\n")
-                continue  # ベンチ時はここで終了（不要処理を完全に通らない）
+                continue
 
-            # ===== infer (test) =====
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
 
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
-                LOGGER.info("Embedding test data with models ({}/{})".format(i + 1, len(PatchCore_list)))
+                LOGGER.info("Embedding test data with model (%d/%d)", i + 1, len(PatchCore_list))
                 scores, segmentations, labels_gt, masks_gt = PatchCore.predict(dataloaders["testing"])
                 aggregator["scores"].append(scores)
                 aggregator["segmentations"].append(segmentations)
 
-            # ===== ensemble normalize (official-like) =====
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
@@ -372,7 +366,6 @@ def run(
 
             anomaly_labels = [x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate]
 
-            # ===== heatmap =====
             if save_segmentation_images:
                 image_paths = [x[2] for x in dataloaders["testing"].dataset.data_to_iterate]
                 mask_paths = [x[3] for x in dataloaders["testing"].dataset.data_to_iterate]
@@ -382,7 +375,7 @@ def run(
                     img = ds.transform_img(image)
                     if hasattr(img, "detach"):
                         img = img.detach()
-                    img = img.cpu().numpy()  # CHW
+                    img = img.cpu().numpy()
 
                     mean = getattr(ds, "transform_mean", None)
                     std = getattr(ds, "transform_std", None)
@@ -416,9 +409,8 @@ def run(
                     image_transform=image_transform,
                     mask_transform=mask_transform,
                 )
-                LOGGER.info("Saved segmentation/heatmap images to: %s", image_save_path)
+                LOGGER.info("Saved segmentation images to: %s", image_save_path)
 
-            # ===== metrics =====
             LOGGER.info("Computing evaluation metrics.")
             image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(scores, anomaly_labels)
             auroc = image_metrics["auroc"]
@@ -446,9 +438,8 @@ def run(
             )
             for key, item in result_collect[-1].items():
                 if key != "dataset_name":
-                    LOGGER.info("{0}: {1:3.3f}".format(key, item))
+                    LOGGER.info("%s: %3.3f", key, item)
 
-            # ===== confusion matrix =====
             class_names = ["normal", "abnormal"]
             y_true = np.asarray(anomaly_labels, dtype=int)
             threshold = image_metrics.get("optimal_threshold", float(np.percentile(scores, 95.0)))
@@ -458,7 +449,6 @@ def run(
             cm_save_dir = os.path.join(run_save_path, "confusion_matrices")
             plot_confusion_matrices(cm, class_names, cm_save_dir, dataset_name)
 
-            # ===== sort copy test images =====
             sorted_base = os.path.join(run_save_path, "sorted_images", dataset_name)
             normal_dir = os.path.join(sorted_base, "normal")
             abnormal_dir = os.path.join(sorted_base, "abnormal")
@@ -477,13 +467,12 @@ def run(
 
             LOGGER.info("Saved sorted images to: %s", sorted_base)
 
-            # ===== save model =====
             if save_patchcore_model:
                 patchcore_save_path = os.path.join(run_save_path, "models", dataset_name)
                 os.makedirs(patchcore_save_path, exist_ok=True)
                 for i, PatchCore in enumerate(PatchCore_list):
                     prepend = (
-                        "Ensemble-{}-{}_".format(i + 1, len(PatchCore_list))
+                        f"Ensemble-{i + 1}-{len(PatchCore_list)}_"
                         if len(PatchCore_list) > 1
                         else ""
                     )
@@ -491,7 +480,6 @@ def run(
 
         LOGGER.info("\n\n-----\n")
 
-    # ===== save final results =====
     if len(result_collect) > 0:
         result_metric_names = list(result_collect[-1].keys())[1:]
         result_dataset_names = [results["dataset_name"] for results in result_collect]
@@ -568,6 +556,8 @@ def patch_core(
                 anomaly_scorer_num_nn=anomaly_scorer_num_nn,
                 nn_method=nn_method,
             )
+
+            patchcore_instance.nn_method = nn_method
             loaded_patchcores.append(patchcore_instance)
         return loaded_patchcores
 
@@ -690,6 +680,7 @@ def dataset(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    LOGGER.info("Command line arguments: {}".format(" ".join(sys.argv)))
+    LOGGER.info("Command line arguments: %s", " ".join(sys.argv))
     main()
+
 
