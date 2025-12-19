@@ -2,16 +2,19 @@
 set -e
 
 cd "$(dirname "$0")"
-
 export PYTHONPATH=src
 
-datapath="/home/yamamoao/patchcore_git/datasets/pose_dataset"
+datapath="/home/yamamao/patchcore_git/datasets/pose_dataset"
+modeldir="/home/yamamao/patchcore_git/patchcore-inspection/results/pose_results/safe_pose_train_24/models/mvtec_safe_pose"
 
-python bin/run_speed.py \
+python bin/run_speed_infer_only.py \
   --gpu 0 \
   --seed 0 \
   --log_group safe_pose_speed \
   --log_project pose_results \
+  --model_dir "$modeldir" \
+  --bench_iters 105 \
+  --bench_warmup 5 \
   results \
   patch_core \
     -b wideresnet50 \
@@ -25,6 +28,6 @@ python bin/run_speed.py \
     approx_greedy_coreset \
     -p 0.1 \
   dataset \
-    --augment \
     -d safe_pose \
     mvtec "$datapath"
+

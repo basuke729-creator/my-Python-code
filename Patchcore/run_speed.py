@@ -15,7 +15,6 @@ import patchcore.sampler
 import patchcore.utils
 
 LOGGER = logging.getLogger(__name__)
-
 _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
 
 
@@ -24,13 +23,7 @@ def _cuda_sync(device):
         torch.cuda.synchronize(device=device)
 
 
-def benchmark_predict(
-    PatchCore,
-    dataloader,
-    device,
-    iters=105,
-    warmup=5,
-):
+def benchmark_predict_only(PatchCore, dataloader, device, iters=105, warmup=5):
     n_images = len(dataloader.dataset)
     times = []
 
@@ -55,32 +48,34 @@ def benchmark_predict(
                 (dt / n_images) * 1000.0,
             )
 
-    times = np.asarray(times[warmup:], dtype=np.float64)
+    kept = np.asarray(times[warmup:], dtype=np.float64)
+    mean_run_s = float(kept.mean())
+    p50_run_s = float(np.percentile(kept, 50))
+    p95_run_s = float(np.percentile(kept, 95))
 
-    mean_run = float(times.mean())
-    p50_run = float(np.percentile(times, 50))
-    p95_run = float(np.percentile(times, 95))
-
-    sec_per_img = mean_run / n_images
-    fps = n_images / mean_run
+    ms_per_img = (mean_run_s / n_images) * 1000.0
+    fps = n_images / mean_run_s
 
     LOGGER.info("========== BENCH RESULT ==========")
     LOGGER.info("Images        : %d", n_images)
-    LOGGER.info("Runs (valid)  : %d", len(times))
-    LOGGER.info("Mean / run    : %.3f s", mean_run)
-    LOGGER.info("P50 / run     : %.3f s", p50_run)
-    LOGGER.info("P95 / run     : %.3f s", p95_run)
-    LOGGER.info("Time / image  : %.3f ms", sec_per_img * 1000.0)
+    LOGGER.info("Runs (valid)  : %d", len(kept))
+    LOGGER.info("Mean / run    : %.3f s", mean_run_s)
+    LOGGER.info("P50 / run     : %.3f s", p50_run_s)
+    LOGGER.info("P95 / run     : %.3f s", p95_run_s)
+    LOGGER.info("Time / image  : %.3f ms", ms_per_img)
     LOGGER.info("FPS           : %.3f", fps)
     LOGGER.info("==================================")
 
 
 @click.group(chain=True)
 @click.argument("results_path", type=str)
-@click.option("--gpu", type=int, default=[0], multiple=True)
-@click.option("--seed", type=int, default=0)
+@click.option("--gpu", type=int, default=[0], multiple=True, show_default=True)
+@click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--log_group", type=str, default="group")
 @click.option("--log_project", type=str, default="project")
+@click.option("--model_dir", type=click.Path(exists=True, file_okay=False), required=True)
+@click.option("--bench_iters", type=int, default=105, show_default=True)
+@click.option("--bench_warmup", type=int, default=5, show_default=True)
 def main(**kwargs):
     pass
 
@@ -93,6 +88,9 @@ def run(
     seed,
     log_group,
     log_project,
+    model_dir,
+    bench_iters,
+    bench_warmup,
 ):
     methods = {key: item for (key, item) in methods}
 
@@ -107,8 +105,8 @@ def run(
 
     for dataloader_count, dataloaders in enumerate(list_of_dataloaders):
         LOGGER.info(
-            "Dataset [{}] ({}/{})".format(
-                dataloaders["training"].name,
+            "Benchmark dataset [{}] ({}/{})".format(
+                dataloaders["testing"].name,
                 dataloader_count + 1,
                 len(list_of_dataloaders),
             )
@@ -125,20 +123,26 @@ def run(
 
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
-                LOGGER.info("Training ({}/{})".format(i + 1, len(PatchCore_list)))
-                PatchCore.fit(dataloaders["training"])
+                LOGGER.info("Loading model (%d/%d) from: %s", i + 1, len(PatchCore_list), model_dir)
 
-            torch.cuda.empty_cache()
+                nn_method = getattr(PatchCore, "anomaly_scorer", None)
+                nn_method = getattr(nn_method, "nn_method", None)
+                if nn_method is None:
+                    nn_method = getattr(PatchCore, "nn_method", None)
 
-            for i, PatchCore in enumerate(PatchCore_list):
+                try:
+                    PatchCore.load_from_path(model_dir, device=device, nn_method=nn_method)
+                except TypeError:
+                    PatchCore.load_from_path(model_dir, device, nn_method)
+
                 torch.cuda.empty_cache()
-                LOGGER.info("Benchmarking predict ({}/{})".format(i + 1, len(PatchCore_list)))
-                benchmark_predict(
+                LOGGER.info("Benchmarking predict (%d/%d)", i + 1, len(PatchCore_list))
+                benchmark_predict_only(
                     PatchCore=PatchCore,
                     dataloader=dataloaders["testing"],
                     device=device,
-                    iters=105,
-                    warmup=5,
+                    iters=bench_iters,
+                    warmup=bench_warmup,
                 )
 
         LOGGER.info("-----")
@@ -184,9 +188,15 @@ def patch_core(
         layers_to_extract_from_coll = [layers_to_extract_from]
 
     def get_patchcore(input_shape, sampler, device):
-        pcs = []
+        loaded = []
         for backbone_name, layers in zip(backbone_names, layers_to_extract_from_coll):
+            backbone_seed = None
+            if ".seed-" in backbone_name:
+                backbone_name, backbone_seed = backbone_name.split(".seed-")[0], int(backbone_name.split("-")[-1])
+
             backbone = patchcore.backbones.load(backbone_name)
+            backbone.name, backbone.seed = backbone_name, backbone_seed
+
             nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
 
             pc = patchcore.patchcore.PatchCore(device)
@@ -202,15 +212,15 @@ def patch_core(
                 anomaly_scorer_num_nn=anomaly_scorer_num_nn,
                 nn_method=nn_method,
             )
-            pcs.append(pc)
-        return pcs
+            loaded.append(pc)
+        return loaded
 
     return ("get_patchcore", get_patchcore)
 
 
 @main.command("sampler")
 @click.argument("name", type=str)
-@click.option("--percentage", "-p", type=float, default=0.1)
+@click.option("--percentage", "-p", type=float, default=0.1, show_default=True)
 def sampler(name, percentage):
     def get_sampler(device):
         if name == "identity":
@@ -227,11 +237,11 @@ def sampler(name, percentage):
 @click.argument("name", type=str)
 @click.argument("data_path", type=click.Path(exists=True, file_okay=False))
 @click.option("--subdatasets", "-d", multiple=True, type=str, required=True)
-@click.option("--train_val_split", type=float, default=1)
-@click.option("--batch_size", default=2)
-@click.option("--num_workers", default=8)
-@click.option("--resize", default=256)
-@click.option("--imagesize", default=224)
+@click.option("--train_val_split", type=float, default=1, show_default=True)
+@click.option("--batch_size", default=2, type=int, show_default=True)
+@click.option("--num_workers", default=8, type=int, show_default=True)
+@click.option("--resize", default=256, type=int, show_default=True)
+@click.option("--imagesize", default=224, type=int, show_default=True)
 @click.option("--augment", is_flag=True)
 def dataset(
     name,
@@ -248,11 +258,11 @@ def dataset(
     dataset_library = __import__(dataset_info[0], fromlist=[dataset_info[1]])
 
     def get_dataloaders(seed):
-        dls = []
-        for sub in subdatasets:
-            train_ds = dataset_library.__dict__[dataset_info[1]](
+        dataloaders = []
+        for subdataset in subdatasets:
+            train_dataset = dataset_library.__dict__[dataset_info[1]](
                 data_path,
-                classname=sub,
+                classname=subdataset,
                 resize=resize,
                 train_val_split=train_val_split,
                 imagesize=imagesize,
@@ -261,35 +271,40 @@ def dataset(
                 augment=augment,
             )
 
-            test_ds = dataset_library.__dict__[dataset_info[1]](
+            test_dataset = dataset_library.__dict__[dataset_info[1]](
                 data_path,
-                classname=sub,
+                classname=subdataset,
                 resize=resize,
                 imagesize=imagesize,
                 split=dataset_library.DatasetSplit.TEST,
                 seed=seed,
             )
 
-            train_dl = torch.utils.data.DataLoader(
-                train_ds,
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset,
                 batch_size=batch_size,
                 shuffle=False,
                 num_workers=num_workers,
                 pin_memory=True,
             )
 
-            test_dl = torch.utils.data.DataLoader(
-                test_ds,
+            test_dataloader = torch.utils.data.DataLoader(
+                test_dataset,
                 batch_size=batch_size,
                 shuffle=False,
                 num_workers=num_workers,
                 pin_memory=True,
             )
 
-            train_dl.name = name + "_" + sub
-            dls.append({"training": train_dl, "testing": test_dl})
+            train_dataloader.name = name
+            if subdataset is not None:
+                train_dataloader.name += "_" + subdataset
+            test_dataloader.name = train_dataloader.name
 
-        return dls
+            dataloaders.append(
+                {"training": train_dataloader, "testing": test_dataloader}
+            )
+        return dataloaders
 
     return ("get_dataloaders", get_dataloaders)
 
