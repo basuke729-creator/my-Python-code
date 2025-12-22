@@ -37,6 +37,55 @@ def _move_to_device(obj, device: torch.device):
     return obj
 
 
+def _extract_images(batch):
+    if torch.is_tensor(batch):
+        return batch
+    if isinstance(batch, (list, tuple)):
+        return batch[0]
+    if isinstance(batch, dict):
+        if "image" in batch:
+            return batch["image"]
+        if "images" in batch:
+            return batch["images"]
+    raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+
+def _predict_over_loader(pc, loader, device: torch.device, exclude_h2d: bool):
+    scores_acc = []
+    segs_acc = []
+    labels_gt = None
+    masks_gt = None
+
+    for batch in loader:
+        images = _extract_images(batch)
+
+        if not torch.is_tensor(images):
+            raise TypeError(f"Extracted images is not a Tensor: {type(images)}")
+
+        if images.dtype != torch.float32:
+            images = images.to(dtype=torch.float32)
+
+        if not exclude_h2d:
+            if images.device != device:
+                images = images.to(device, non_blocking=True)
+
+        out = pc.predict(images)
+
+        if isinstance(out, (tuple, list)):
+            if len(out) >= 2:
+                scores_i = out[0]
+                segs_i = out[1]
+                scores_acc.append(scores_i)
+                segs_acc.append(segs_i)
+            if len(out) >= 4:
+                labels_gt = out[2]
+                masks_gt = out[3]
+        else:
+            scores_acc.append(out)
+
+    return scores_acc, segs_acc, labels_gt, masks_gt
+
+
 class _CachedLoader:
     def __init__(self, batches, dataset=None, name="cached"):
         self._batches = batches
@@ -207,7 +256,7 @@ def run(
             with torch.no_grad():
                 _sync(device)
                 t0_w = time.perf_counter()
-                _ = PatchCore_list[0].predict(warm_loader)
+                _predict_over_loader(PatchCore_list[0], warm_loader, device=device, exclude_h2d=bench_exclude_h2d)
                 _sync(device)
                 t1_w = time.perf_counter()
                 warm_ms = (t1_w - t0_w) * 1000.0 / max(1, len(warm_loader))
@@ -221,7 +270,9 @@ def run(
                 labels_gt = None
                 masks_gt = None
                 for pc in PatchCore_list:
-                    scores_i, segs_i, labels_gt, masks_gt = pc.predict(meas_loader)
+                    scores_i, segs_i, labels_gt, masks_gt = _predict_over_loader(
+                        pc, meas_loader, device=device, exclude_h2d=bench_exclude_h2d
+                    )
                     scores_list.append(scores_i)
                     segs_list.append(segs_i)
 
@@ -333,4 +384,6 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     LOGGER.info("Command line arguments: %s", " ".join(sys.argv))
     main()
+
+
 
