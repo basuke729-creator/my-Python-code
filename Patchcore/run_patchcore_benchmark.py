@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import time
+from typing import Any, Dict, List, Tuple
 
 import click
 import numpy as np
@@ -19,19 +20,103 @@ LOGGER = logging.getLogger(__name__)
 _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
 
 
-def _sync_if_cuda(device):
-    if device is not None and "cuda" in device.type.lower():
+def _is_cuda(device: torch.device) -> bool:
+    return device is not None and "cuda" in device.type.lower()
+
+
+def _sync_if_cuda(device: torch.device) -> None:
+    if _is_cuda(device):
         torch.cuda.synchronize(device=device)
 
 
-def _subset_dataloader(base_dataset, indices, batch_size=1, num_workers=0, pin_memory=True):
-    subset = torch.utils.data.Subset(base_dataset, indices)
-    return torch.utils.data.DataLoader(
+def _move_tensors_to_device(obj: Any, device: torch.device) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device, non_blocking=True)
+    if isinstance(obj, dict):
+        return {k: _move_tensors_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        moved = [_move_tensors_to_device(v, device) for v in obj]
+        return type(obj)(moved)
+    return obj
+
+
+class _PreloadedDataset(torch.utils.data.Dataset):
+    def __init__(self, samples: List[Any]):
+        self.samples = samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Any:
+        return self.samples[idx]
+
+
+def _make_preloaded_loader(
+    original_dataset: torch.utils.data.Dataset,
+    indices: List[int],
+    device: torch.device,
+    exclude_h2d: bool,
+    batch_size: int = 1,
+) -> torch.utils.data.DataLoader:
+    samples: List[Any] = []
+    for i in indices:
+        sample = original_dataset[i]
+        if exclude_h2d and _is_cuda(device):
+            sample = _move_tensors_to_device(sample, device)
+        samples.append(sample)
+
+    ds = _PreloadedDataset(samples)
+    loader = torch.utils.data.DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+    )
+    loader.name = getattr(original_dataset, "name", "dataset")
+    return loader
+
+
+def _subset_loader_from_dataset(
+    original_dataset: torch.utils.data.Dataset,
+    indices: List[int],
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+) -> torch.utils.data.DataLoader:
+    subset = torch.utils.data.Subset(original_dataset, indices)
+    loader = torch.utils.data.DataLoader(
         subset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        drop_last=False,
+    )
+    loader.name = getattr(original_dataset, "name", "dataset")
+    return loader
+
+
+def _load_patchcore_from_dir(patchcore_instance, model_dir: str) -> None:
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"--model_dir must be a directory: {model_dir}")
+
+    if hasattr(patchcore_instance, "load_from_path"):
+        patchcore_instance.load_from_path(model_dir)
+        return
+
+    if hasattr(patchcore_instance, "load_from_checkpoint"):
+        patchcore_instance.load_from_checkpoint(model_dir)
+        return
+
+    if hasattr(patchcore_instance, "load_from_path"):
+        patchcore_instance.load_from_path(model_dir)
+        return
+
+    raise RuntimeError(
+        "PatchCore instance has no supported load method. "
+        "Expected load_from_path() or load_from_checkpoint()."
     )
 
 
@@ -41,153 +126,162 @@ def _subset_dataloader(base_dataset, indices, batch_size=1, num_workers=0, pin_m
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--log_group", type=str, default="group")
 @click.option("--log_project", type=str, default="project")
-@click.option("--model_dir", type=str, default="", show_default=True)
-@click.option("--faiss_on_gpu", is_flag=True)
-@click.option("--faiss_num_workers", type=int, default=8, show_default=True)
-@click.option("--bench_iters", type=int, default=105, show_default=True)
+@click.option("--model_dir", type=str, default=None, help="Directory containing saved PatchCore model(s).")
+@click.option("--bench_only", is_flag=True, help="Benchmark only (no training, no metrics, no outputs).")
+@click.option("--bench_n", type=int, default=105, show_default=True)
 @click.option("--bench_warmup", type=int, default=5, show_default=True)
 @click.option("--bench_image_index", type=int, default=0, show_default=True)
+@click.option("--bench_batch_size", type=int, default=1, show_default=True)
 @click.option("--bench_num_workers", type=int, default=0, show_default=True)
+@click.option("--bench_exclude_io", is_flag=True, help="Exclude disk I/O by preloading samples before timing.")
+@click.option("--bench_exclude_h2d", is_flag=True, help="Exclude CPU->GPU transfer by moving tensors to GPU before timing.")
 def main(**kwargs):
     pass
 
 
 @main.result_callback()
 def run(
-    methods,
-    results_path,
-    gpu,
-    seed,
-    log_group,
-    log_project,
-    model_dir,
-    faiss_on_gpu,
-    faiss_num_workers,
-    bench_iters,
-    bench_warmup,
-    bench_image_index,
-    bench_num_workers,
+    methods: List[Tuple[str, Any]],
+    results_path: str,
+    gpu: Tuple[int, ...],
+    seed: int,
+    log_group: str,
+    log_project: str,
+    model_dir: str,
+    bench_only: bool,
+    bench_n: int,
+    bench_warmup: int,
+    bench_image_index: int,
+    bench_batch_size: int,
+    bench_num_workers: int,
+    bench_exclude_io: bool,
+    bench_exclude_h2d: bool,
 ):
-    methods = {k: v for (k, v) in methods}
-
-    if bench_warmup < 0 or bench_iters <= 0 or bench_warmup >= bench_iters:
-        raise click.ClickException("bench_warmup must be >=0 and < bench_iters.")
+    methods = {key: item for (key, item) in methods}
 
     run_save_path = patchcore.utils.create_storage_folder(
         results_path, log_project, log_group, mode="iterate"
     )
-
     list_of_dataloaders = methods["get_dataloaders"](seed)
 
     device = patchcore.utils.set_torch_device(gpu)
     device_context = (
         torch.cuda.device(f"cuda:{device.index}")
-        if "cuda" in device.type.lower()
+        if _is_cuda(device)
         else contextlib.suppress()
     )
 
-    nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
-
-    with device_context:
-        for dataloader_count, dataloaders in enumerate(list_of_dataloaders):
-            train_loader = dataloaders["training"]
-            test_loader = dataloaders["testing"]
-
-            dataset_name = getattr(train_loader, "name", None)
-            if dataset_name is None:
-                dataset_name = "dataset_{}".format(dataloader_count)
-
-            LOGGER.info(
-                "Benchmarking dataset [{}] ({}/{})...".format(
-                    dataset_name, dataloader_count + 1, len(list_of_dataloaders)
-                )
+    for dataloader_count, dataloaders in enumerate(list_of_dataloaders):
+        dataset_name = dataloaders["training"].name
+        LOGGER.info(
+            "Evaluating dataset [{}] ({}/{})...".format(
+                dataset_name,
+                dataloader_count + 1,
+                len(list_of_dataloaders),
             )
+        )
 
-            patchcore.utils.fix_seeds(seed, device)
-            torch.cuda.empty_cache() if "cuda" in device.type.lower() else None
+        patchcore.utils.fix_seeds(seed, device)
 
-            imagesize = train_loader.dataset.imagesize
+        with device_context:
+            torch.cuda.empty_cache()
+
+            imagesize = dataloaders["training"].dataset.imagesize
             sampler = methods["get_sampler"](device)
             PatchCore_list = methods["get_patchcore"](imagesize, sampler, device)
 
-            if model_dir:
-                load_dir = model_dir
-            else:
-                load_dir = os.path.join(run_save_path, "models", dataset_name)
+            if len(PatchCore_list) > 1:
+                LOGGER.info("Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list)))
 
-            LOGGER.info("Loading model(s) from: %s", load_dir)
+            if bench_only:
+                if not model_dir:
+                    raise click.ClickException("--bench_only requires --model_dir")
 
-            loaded_list = []
-            for _ in PatchCore_list:
-                pc = patchcore.patchcore.PatchCore(device)
-                pc.load_from_path(load_dir, device=device, nn_method=nn_method)
-                loaded_list.append(pc)
-            PatchCore_list = loaded_list
+                test_loader = dataloaders["testing"]
+                base_ds = test_loader.dataset
 
-            base_test_ds = test_loader.dataset
-            n_test = len(base_test_ds)
+                total_needed = int(bench_n)
+                warm = int(bench_warmup)
+                meas = max(0, total_needed - warm)
 
-            start = bench_image_index
-            end = bench_image_index + bench_iters
-            if end > n_test:
-                raise click.ClickException(
-                    f"Not enough test images. Need {bench_iters} from index {bench_image_index}, "
-                    f"but test size is {n_test}."
-                )
+                start = int(bench_image_index)
+                warm_indices = list(range(start, min(start + warm, len(base_ds))))
+                meas_indices = list(range(start + warm, min(start + warm + meas, len(base_ds))))
 
-            warmup_indices = list(range(start, start + bench_warmup))
-            meas_indices = list(range(start + bench_warmup, start + bench_iters))
+                warm_count = len(warm_indices)
+                meas_count = len(meas_indices)
 
-            warmup_loader = _subset_dataloader(
-                base_test_ds,
-                warmup_indices,
-                batch_size=1,
-                num_workers=bench_num_workers,
-                pin_memory=True,
-            )
-            meas_loader = _subset_dataloader(
-                base_test_ds,
-                meas_indices,
-                batch_size=1,
-                num_workers=bench_num_workers,
-                pin_memory=True,
-            )
+                if warm_count < warm or meas_count < meas:
+                    LOGGER.warning(
+                        "Requested bench_n=%d warmup=%d starting_at=%d, but dataset size=%d. Using warm=%d meas=%d.",
+                        total_needed, warm, start, len(base_ds), warm_count, meas_count
+                    )
 
-            LOGGER.info(
-                "[BENCH] Start: iters=%d warmup=%d image_index=%d test_size=%d ensemble=%d",
-                bench_iters,
-                bench_warmup,
-                bench_image_index,
-                n_test,
-                len(PatchCore_list),
-            )
+                pin_memory = True
 
-            if bench_warmup > 0:
-                _sync_if_cuda(device)
-                t0 = time.perf_counter()
-                for pc in PatchCore_list:
-                    pc.predict(warmup_loader)
-                _sync_if_cuda(device)
-                t1 = time.perf_counter()
-                warmup_ms = (t1 - t0) * 1000.0 / float(bench_warmup)
-                LOGGER.info("[BENCH] warmup mean: %.3f ms / image (n=%d)", warmup_ms, bench_warmup)
+                if bench_exclude_io:
+                    warm_loader = _make_preloaded_loader(
+                        base_ds, warm_indices, device, exclude_h2d=bench_exclude_h2d, batch_size=bench_batch_size
+                    )
+                    meas_loader = _make_preloaded_loader(
+                        base_ds, meas_indices, device, exclude_h2d=bench_exclude_h2d, batch_size=bench_batch_size
+                    )
+                else:
+                    warm_loader = _subset_loader_from_dataset(
+                        base_ds, warm_indices, batch_size=bench_batch_size, num_workers=bench_num_workers, pin_memory=pin_memory
+                    )
+                    meas_loader = _subset_loader_from_dataset(
+                        base_ds, meas_indices, batch_size=bench_batch_size, num_workers=bench_num_workers, pin_memory=pin_memory
+                    )
 
-            _sync_if_cuda(device)
-            t0 = time.perf_counter()
-            for pc in PatchCore_list:
-                pc.predict(meas_loader)
-            _sync_if_cuda(device)
-            t1 = time.perf_counter()
+                torch.set_grad_enabled(False)
 
-            elapsed = (t1 - t0)
-            n = len(meas_indices)
-            mean_ms = (elapsed * 1000.0) / float(n)
-            fps = float(n) / elapsed if elapsed > 0 else float("inf")
+                for i, PatchCore in enumerate(PatchCore_list):
+                    torch.cuda.empty_cache()
 
-            LOGGER.info("[BENCH] mean: %.3f ms / image", mean_ms)
-            LOGGER.info("[BENCH] FPS : %.2f", fps)
-            LOGGER.info("[BENCH] Done.")
-            LOGGER.info("-----")
+                    model_subdir = model_dir
+                    if len(PatchCore_list) > 1:
+                        candidates = [
+                            os.path.join(model_dir, f"Ensemble-{i+1}-{len(PatchCore_list)}_"),
+                            os.path.join(model_dir, f"Ensemble-{i+1}-{len(PatchCore_list)}"),
+                        ]
+                        model_subdir = model_dir
+                        for c in candidates:
+                            if os.path.exists(c):
+                                model_subdir = c
+                                break
+
+                    _load_patchcore_from_dir(PatchCore, model_subdir)
+
+                    LOGGER.info("Warmup ({}/{})".format(i + 1, len(PatchCore_list)))
+                    _sync_if_cuda(device)
+                    PatchCore.predict(warm_loader)
+                    _sync_if_cuda(device)
+
+                times = []
+                for i, PatchCore in enumerate(PatchCore_list):
+                    LOGGER.info("Measured ({}/{})".format(i + 1, len(PatchCore_list)))
+                    _sync_if_cuda(device)
+                    t0 = time.perf_counter()
+                    PatchCore.predict(meas_loader)
+                    _sync_if_cuda(device)
+                    t1 = time.perf_counter()
+                    times.append(t1 - t0)
+
+                elapsed = float(np.mean(times)) if times else float("nan")
+                fps = (float(meas_count) / elapsed) if elapsed > 0 else float("nan")
+
+                LOGGER.info("=== PatchCore Benchmark Result ===")
+                LOGGER.info("dataset=%s", dataset_name)
+                LOGGER.info("bench_image_index=%d", start)
+                LOGGER.info("bench_total=%d warmup=%d measured=%d", warm_count + meas_count, warm_count, meas_count)
+                LOGGER.info("exclude_io=%s exclude_h2d=%s", str(bench_exclude_io), str(bench_exclude_h2d))
+                LOGGER.info("elapsed_sec_mean_over_models=%.6f", elapsed)
+                LOGGER.info("fps=%.3f", fps)
+
+                continue
+
+            raise click.ClickException("This script is benchmark-only in this version. Use --bench_only.")
 
 
 @main.command("patch_core")
@@ -202,6 +296,8 @@ def run(
 @click.option("--patchscore", type=str, default="max")
 @click.option("--patchoverlap", type=float, default=0.0)
 @click.option("--patchsize_aggregate", "-pa", type=int, multiple=True, default=[])
+@click.option("--faiss_on_gpu", is_flag=True)
+@click.option("--faiss_num_workers", type=int, default=8)
 def patch_core(
     backbone_names,
     layers_to_extract_from,
@@ -214,6 +310,8 @@ def patch_core(
     patchoverlap,
     anomaly_scorer_num_nn,
     patchsize_aggregate,
+    faiss_on_gpu,
+    faiss_num_workers,
 ):
     backbone_names = list(backbone_names)
     if len(backbone_names) > 1:
@@ -228,8 +326,14 @@ def patch_core(
     def get_patchcore(input_shape, sampler, device):
         loaded_patchcores = []
         for backbone_name, layers_to_extract_from in zip(backbone_names, layers_to_extract_from_coll):
+            backbone_seed = None
+            if ".seed-" in backbone_name:
+                backbone_name, backbone_seed = backbone_name.split(".seed-")[0], int(backbone_name.split("-")[-1])
+
             backbone = patchcore.backbones.load(backbone_name)
-            backbone.name = backbone_name
+            backbone.name, backbone.seed = backbone_name, backbone_seed
+
+            nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
 
             patchcore_instance = patchcore.patchcore.PatchCore(device)
             patchcore_instance.load(
@@ -242,7 +346,7 @@ def patch_core(
                 patchsize=patchsize,
                 featuresampler=sampler,
                 anomaly_scorer_num_nn=anomaly_scorer_num_nn,
-                nn_method=None,
+                nn_method=nn_method,
             )
             loaded_patchcores.append(patchcore_instance)
         return loaded_patchcores
@@ -261,7 +365,6 @@ def sampler(name, percentage):
             return patchcore.sampler.GreedyCoresetSampler(percentage, device)
         elif name == "approx_greedy_coreset":
             return patchcore.sampler.ApproximateGreedyCoresetSampler(percentage, device)
-        raise click.ClickException(f"Unknown sampler: {name}")
 
     return ("get_sampler", get_sampler)
 
@@ -329,33 +432,16 @@ def dataset(
                 pin_memory=True,
             )
 
-            train_dataloader.name = name + (f"_{subdataset}" if subdataset is not None else "")
-            test_dataloader.name = train_dataloader.name
+            train_dataloader.name = name
+            if subdataset is not None:
+                train_dataloader.name += "_" + subdataset
 
-            if train_val_split < 1:
-                val_dataset = dataset_library.__dict__[dataset_info[1]](
-                    data_path,
-                    classname=subdataset,
-                    resize=resize,
-                    train_val_split=train_val_split,
-                    imagesize=imagesize,
-                    split=dataset_library.DatasetSplit.VAL,
-                    seed=seed,
-                )
-                val_dataloader = torch.utils.data.DataLoader(
-                    val_dataset,
-                    batch_size=batch_size,
-                    shuffle=False,
-                    num_workers=num_workers,
-                    pin_memory=True,
-                )
-                val_dataloader.name = train_dataloader.name
-            else:
-                val_dataloader = None
-
-            dataloaders.append(
-                {"training": train_dataloader, "validation": val_dataloader, "testing": test_dataloader}
-            )
+            dataloader_dict = {
+                "training": train_dataloader,
+                "validation": None,
+                "testing": test_dataloader,
+            }
+            dataloaders.append(dataloader_dict)
         return dataloaders
 
     return ("get_dataloaders", get_dataloaders)
@@ -363,7 +449,7 @@ def dataset(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    LOGGER.info("Command line arguments: %s", " ".join(sys.argv))
+    LOGGER.info("Command line arguments: {}".format(" ".join(sys.argv)))
     main()
 
 
