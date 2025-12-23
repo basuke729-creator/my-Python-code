@@ -1,15 +1,19 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import contextlib
 import logging
 import os
 import sys
 import shutil
+from pathlib import Path
 
 import click
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
 from PIL import Image
+from sklearn.metrics import confusion_matrix
 
 import patchcore.backbones
 import patchcore.common
@@ -23,11 +27,101 @@ LOGGER = logging.getLogger(__name__)
 _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
 
 
+# -----------------------------
+# Utils: safe image / mask conversion
+# -----------------------------
+def _imagesize_to_int(imagesize):
+    """imagesize が int または (H,W) のどちらでも安全に int(H) を返す"""
+    if isinstance(imagesize, (tuple, list)):
+        return int(imagesize[0])
+    return int(imagesize)
+
+
+def _to_numpy(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _ensure_hwc_uint8(img):
+    """
+    img: torch or np
+    Return: HWC uint8 (3ch)
+    """
+    arr = _to_numpy(img)
+
+    # (C,H,W) -> (H,W,C)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[1] != 3:
+        arr = np.transpose(arr, (1, 2, 0))
+
+    # (H,W) -> (H,W,1)
+    if arr.ndim == 2:
+        arr = arr[..., None]
+
+    # channel adjust
+    if arr.shape[2] == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    elif arr.shape[2] > 3:
+        arr = arr[:, :, :3]
+
+    # float -> uint8
+    if arr.dtype != np.uint8:
+        # 0-1 っぽければ 255 スケール、そうでなければ clip
+        arr_min, arr_max = float(arr.min()), float(arr.max())
+        if 0.0 <= arr_min and arr_max <= 1.5:
+            arr = arr * 255.0
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    return arr
+
+
+def _ensure_hw_mask(mask):
+    """
+    mask: torch or np
+    Return: HW float32 (0..1 or 0..255 ok)
+    """
+    arr = _to_numpy(mask)
+
+    # (C,H,W) -> (H,W)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = arr[0]  # まず1chへ
+
+    # (H,W,C) -> (H,W)
+    if arr.ndim == 3 and arr.shape[2] in (1, 3):
+        arr = arr[:, :, 0]
+
+    if arr.ndim != 2:
+        # 最後の保険
+        arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            raise ValueError(f"Unexpected mask shape after squeeze: {arr.shape}")
+
+    return arr.astype(np.float32)
+
+
+def _resize_image_hwc(img_hwc_uint8, out_size):
+    """HWC uint8 -> out_size x out_size HWC uint8"""
+    pil = Image.fromarray(img_hwc_uint8)
+    pil = pil.resize((out_size, out_size), resample=Image.BILINEAR)
+    return np.array(pil)
+
+
+def _resize_mask_hw(mask_hw, out_size):
+    """HW float -> out_size x out_size HW float (nearest)"""
+    # 0..1/255 どちらでも OK
+    pil = Image.fromarray(mask_hw.astype(np.float32))
+    pil = pil.resize((out_size, out_size), resample=Image.NEAREST)
+    return np.array(pil).astype(np.float32)
+
+
+# -----------------------------
+# Confusion matrices
+# -----------------------------
 def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
-    """枚数ベース＋行正規化(%)の混同行列を保存する（どちらもBlues）。"""
+    """枚数ベース＋行正規化(%)の混同行列を保存（どちらも Blues）"""
     os.makedirs(save_dir, exist_ok=True)
 
-    # ===== 枚数ベース（counts）=====
+    # counts
     fig, ax = plt.subplots()
     im = ax.imshow(cm, vmin=0, vmax=max(1, cm.max()), cmap="Blues")
     ax.set_xticks(range(len(class_names)))
@@ -42,11 +136,8 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
             ax.text(
-                j,
-                i,
-                str(cm[i, j]),
-                ha="center",
-                va="center",
+                j, i, str(cm[i, j]),
+                ha="center", va="center",
                 color="white" if cm[i, j] > vmax * 0.5 else "black",
             )
 
@@ -55,12 +146,11 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     fig.savefig(count_path, bbox_inches="tight", dpi=200)
     plt.close(fig)
 
-    # ===== 行方向で正規化(%) =====
+    # row-normalized %
     with np.errstate(divide="ignore", invalid="ignore"):
         denom = cm.sum(axis=1, keepdims=True)
         cm_norm = np.divide(
-            cm.astype(np.float32),
-            denom,
+            cm.astype(np.float32), denom,
             out=np.zeros_like(cm, dtype=np.float32),
             where=(denom != 0),
         )
@@ -79,11 +169,8 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
         for j in range(cm_norm.shape[1]):
             val = cm_norm[i, j] * 100.0
             ax.text(
-                j,
-                i,
-                f"{val:.1f}",
-                ha="center",
-                va="center",
+                j, i, f"{val:.1f}",
+                ha="center", va="center",
                 color="white" if cm_norm[i, j] > 0.5 else "black",
             )
 
@@ -97,73 +184,104 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     LOGGER.info("  norm  : %s", norm_path)
 
 
-def save_heatmap_panels_v2(
-    image_paths,
-    segmentations,
+# -----------------------------
+# Heatmap writer (robust)
+# -----------------------------
+def save_heatmap_triplets(
     save_dir,
-    out_size,
-    pred_mask_percentile=99.0,
+    image_paths,
+    segmentations,  # (N,H,W) or (N,1,H,W)
+    scores,         # (N,)
+    mask_paths=None,
+    dataset=None,
 ):
     """
-    右の例の形式で保存:
-      [Image] [Image + Anomaly Map] [Image + Pred Mask(contour)]
-    - GTマスクは表示しない（真ん中黒問題の原因を排除）
+    右の例みたいに
+      [Image] [Image + Anomaly Map] [Image + Pred Mask(輪郭)]
+    を1枚のpngにして保存する（shape事故が起きないよう全部防御）
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    # 予測マスク用の閾値（全segの上位p%）
-    pred_thr = float(np.percentile(segmentations.reshape(-1), pred_mask_percentile))
+    # seg shape normalize -> (N,H,W)
+    seg = np.asarray(segmentations)
+    if seg.ndim == 4 and seg.shape[1] == 1:
+        seg = seg[:, 0]
+    if seg.ndim != 3:
+        raise ValueError(f"Unexpected segmentations shape: {seg.shape}")
+
+    out_size = None
+    if dataset is not None and hasattr(dataset, "imagesize"):
+        out_size = _imagesize_to_int(dataset.imagesize)
 
     for idx, img_path in enumerate(image_paths):
-        # --- load image ---
-        im = Image.open(img_path).convert("RGB")
-        im = im.resize((out_size, out_size), resample=Image.BILINEAR)
-        im_np = np.asarray(im)
+        try:
+            # --- load original image ---
+            img = Image.open(img_path).convert("RGB")
+            img_np = np.array(img)  # HWC uint8
 
-        # --- seg map normalize 0..1 ---
-        seg = segmentations[idx]
-        if seg.ndim == 3:
-            seg = seg.squeeze()
-        seg = seg.astype(np.float32)
-        seg_min, seg_max = float(seg.min()), float(seg.max())
-        seg_norm = (seg - seg_min) / (seg_max - seg_min + 1e-12)
+            # resize image to out_size if available (segmentation側と揃える)
+            if out_size is not None:
+                img_np_rs = _resize_image_hwc(img_np, out_size)
+            else:
+                img_np_rs = img_np
 
-        # --- pred mask ---
-        pred_mask = seg >= pred_thr
+            # --- anomaly map ---
+            amap = seg[idx]
+            amap = _ensure_hw_mask(amap)
 
-        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            # segmentation map sizeに合わせる
+            if out_size is not None and (amap.shape[0] != out_size or amap.shape[1] != out_size):
+                amap = _resize_mask_hw(amap, out_size)
 
-        axes[0].imshow(im_np)
-        axes[0].set_title("Image")
-        axes[0].axis("off")
+            # normalize to 0..1 for colormap
+            a_min, a_max = float(amap.min()), float(amap.max())
+            amap_norm = (amap - a_min) / (a_max - a_min + 1e-12)
 
-        axes[1].imshow(im_np)
-        axes[1].imshow(seg_norm, alpha=0.5)
-        axes[1].set_title("Image + Anomaly Map")
-        axes[1].axis("off")
+            # threshold for predicted mask (簡易: 99 percentile)
+            thr = float(np.percentile(amap_norm, 99.0))
+            pred_mask = (amap_norm >= thr).astype(np.uint8)  # 0/1
 
-        axes[2].imshow(im_np)
-        axes[2].contour(pred_mask.astype(np.uint8), levels=[0.5], colors="red", linewidths=2)
-        axes[2].set_title("Image + Pred Mask")
-        axes[2].axis("off")
+            # --- plot ---
+            fig = plt.figure(figsize=(12, 4))
+            ax1 = fig.add_subplot(1, 3, 1)
+            ax2 = fig.add_subplot(1, 3, 2)
+            ax3 = fig.add_subplot(1, 3, 3)
 
-        save_name = os.path.basename(img_path)
-        save_path = os.path.join(save_dir, save_name)
-        fig.tight_layout()
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
+            ax1.imshow(img_np_rs)
+            ax1.set_title("Image")
+            ax1.axis("off")
 
-    LOGGER.info("Saved heatmap panels to: %s", save_dir)
-    LOGGER.info("pred_mask_percentile=%.1f -> pred_thr=%.6f", pred_mask_percentile, pred_thr)
+            ax2.imshow(img_np_rs)
+            ax2.imshow(amap_norm, alpha=0.55, cmap="jet")
+            ax2.set_title("Image + Anomaly Map")
+            ax2.axis("off")
+
+            ax3.imshow(img_np_rs)
+            # 輪郭線（赤）
+            ax3.contour(pred_mask, levels=[0.5], colors="red", linewidths=2)
+            ax3.set_title("Image + Pred Mask")
+            ax3.axis("off")
+
+            base = Path(img_path).stem
+            out_path = os.path.join(save_dir, f"{base}_score_{scores[idx]:.6f}.png")
+            fig.tight_layout()
+            fig.savefig(out_path, dpi=200)
+            plt.close(fig)
+
+        except Exception as e:
+            LOGGER.warning("Failed to save heatmap for %s: %s", img_path, e)
 
 
+# -----------------------------
+# Click CLI
+# -----------------------------
 @click.group(chain=True)
 @click.argument("results_path", type=str)
 @click.option("--gpu", type=int, default=[0], multiple=True, show_default=True)
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--log_group", type=str, default="group")
 @click.option("--log_project", type=str, default="project")
-@click.option("--save_segmentation_images", is_flag=True, help="ヒートマップ(可視化画像)を保存する")
+@click.option("--save_segmentation_images", is_flag=True, help="ヒートマップ画像を保存")
 @click.option("--save_patchcore_model", is_flag=True)
 def main(**kwargs):
     pass
@@ -199,11 +317,10 @@ def run(
 
     for dataloader_count, dataloaders in enumerate(list_of_dataloaders):
         LOGGER.info(
-            "Evaluating dataset [{}] ({}/{})...".format(
-                dataloaders["training"].name,
-                dataloader_count + 1,
-                len(list_of_dataloaders),
-            )
+            "Evaluating dataset [%s] (%d/%d)...",
+            dataloaders["training"].name,
+            dataloader_count + 1,
+            len(list_of_dataloaders),
         )
 
         patchcore.utils.fix_seeds(seed, device)
@@ -217,28 +334,30 @@ def run(
             PatchCore_list = methods["get_patchcore"](imagesize, sampler, device)
 
             if len(PatchCore_list) > 1:
-                LOGGER.info("Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list)))
+                LOGGER.info("Utilizing PatchCore Ensemble (N=%d).", len(PatchCore_list))
 
-            # ===== 学習 =====
+            # train
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
                 if PatchCore.backbone.seed is not None:
                     patchcore.utils.fix_seeds(PatchCore.backbone.seed, device)
-                LOGGER.info("Training models ({}/{})".format(i + 1, len(PatchCore_list)))
+                LOGGER.info("Training models (%d/%d)", i + 1, len(PatchCore_list))
                 PatchCore.fit(dataloaders["training"])
 
-            # ===== 推論（test）=====
+            # infer (test)
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
 
+            labels_gt = None
+            masks_gt = None
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
-                LOGGER.info("Embedding test data with models ({}/{})".format(i + 1, len(PatchCore_list)))
+                LOGGER.info("Embedding test data with models (%d/%d)", i + 1, len(PatchCore_list))
                 scores, segmentations, labels_gt, masks_gt = PatchCore.predict(dataloaders["testing"])
                 aggregator["scores"].append(scores)
                 aggregator["segmentations"].append(segmentations)
 
-            # ===== Ensemble 正規化（元の公式処理に合わせる）=====
+            # ensemble normalize (official-like)
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
@@ -259,34 +378,32 @@ def run(
             segmentations = (segmentations - min_scores) / (max_scores - min_scores + 1e-12)
             segmentations = np.mean(segmentations, axis=0)
 
-            # True label（"good" 以外を異常扱い）
-            anomaly_labels = [
-                x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
-            ]
+            # true label: "good" 以外を異常
+            anomaly_labels = [x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate]
 
-            # ===== ヒートマップ可視化（右の形式で保存）=====
+            # ---- heatmaps ----
             if save_segmentation_images:
-                ds = dataloaders["testing"].dataset
-                image_paths = [x[2] for x in ds.data_to_iterate]
-
-                # segのH,Wと合わせる（imagesizeが基本）
-                if hasattr(ds, "imagesize"):
-                    out_size = int(ds.imagesize)
-                else:
-                    out_size = int(segmentations.shape[-1])
+                image_paths = [x[2] for x in dataloaders["testing"].dataset.data_to_iterate]
+                # mask_paths は無いデータセットもあるので optional
+                mask_paths = []
+                for x in dataloaders["testing"].dataset.data_to_iterate:
+                    if len(x) >= 4:
+                        mask_paths.append(x[3])
+                    else:
+                        mask_paths.append(None)
 
                 image_save_path = os.path.join(run_save_path, "segmentation_images_v2", dataset_name)
-
-                # percentileは必要なら調整（例：99.5にすると輪郭が絞れる）
-                save_heatmap_panels_v2(
-                    image_paths=image_paths,
-                    segmentations=segmentations,
-                    save_dir=image_save_path,
-                    out_size=out_size,
-                    pred_mask_percentile=99.0,
+                save_heatmap_triplets(
+                    image_save_path,
+                    image_paths,
+                    segmentations,
+                    scores,
+                    mask_paths=mask_paths,
+                    dataset=dataloaders["testing"].dataset,
                 )
+                LOGGER.info("Saved segmentation/heatmap images to: %s", image_save_path)
 
-            # ===== 評価指標 =====
+            # metrics
             LOGGER.info("Computing evaluation metrics.")
             image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(scores, anomaly_labels)
             auroc = image_metrics["auroc"]
@@ -314,13 +431,12 @@ def run(
             )
             for key, item in result_collect[-1].items():
                 if key != "dataset_name":
-                    LOGGER.info("{0}: {1:3.3f}".format(key, item))
+                    LOGGER.info("%s: %.3f", key, item)
 
-            # ===== 混同行列 =====
+            # confusion matrix
             class_names = ["normal", "abnormal"]
             y_true = np.asarray(anomaly_labels, dtype=int)
 
-            # しきい値：metrics に optimal_threshold があればそれ、なければ95%tile
             threshold = image_metrics.get("optimal_threshold", float(np.percentile(scores, 95.0)))
             y_pred = (scores >= threshold).astype(int)
 
@@ -328,7 +444,7 @@ def run(
             cm_save_dir = os.path.join(run_save_path, "confusion_matrices")
             plot_confusion_matrices(cm, class_names, cm_save_dir, dataset_name)
 
-            # ===== テスト画像を normal / abnormal に仕分けコピー =====
+            # sort images copy
             sorted_base = os.path.join(run_save_path, "sorted_images", dataset_name)
             normal_dir = os.path.join(sorted_base, "normal")
             abnormal_dir = os.path.join(sorted_base, "abnormal")
@@ -347,21 +463,17 @@ def run(
 
             LOGGER.info("Saved sorted images to: %s", sorted_base)
 
-            # ===== PatchCore モデル保存 =====
+            # save model
             if save_patchcore_model:
                 patchcore_save_path = os.path.join(run_save_path, "models", dataset_name)
                 os.makedirs(patchcore_save_path, exist_ok=True)
                 for i, PatchCore in enumerate(PatchCore_list):
-                    prepend = (
-                        "Ensemble-{}-{}_".format(i + 1, len(PatchCore_list))
-                        if len(PatchCore_list) > 1
-                        else ""
-                    )
+                    prepend = f"Ensemble-{i+1}-{len(PatchCore_list)}_" if len(PatchCore_list) > 1 else ""
                     PatchCore.save_to_path(patchcore_save_path, prepend)
 
         LOGGER.info("\n\n-----\n")
 
-    # ===== 全データセット結果をCSVに保存 =====
+    # store final csv
     result_metric_names = list(result_collect[-1].keys())[1:]
     result_dataset_names = [results["dataset_name"] for results in result_collect]
     result_scores = [list(results.values())[1:] for results in result_collect]
@@ -422,8 +534,7 @@ def patch_core(
             backbone = patchcore.backbones.load(backbone_name)
             backbone.name, backbone.seed = backbone_name, backbone_seed
 
-            # NOTE: FaissNN の引数は環境差が出やすいので
-            #       「位置引数」で渡して互換性を最大化
+            # FaissNN の引数差異を吸収（バージョン差で keyword が無いケースがあるため positional）
             nn_method = patchcore.common.FaissNN(faiss_on_gpu, faiss_num_workers)
 
             patchcore_instance = patchcore.patchcore.PatchCore(device)
@@ -456,6 +567,8 @@ def sampler(name, percentage):
             return patchcore.sampler.GreedyCoresetSampler(percentage, device)
         elif name == "approx_greedy_coreset":
             return patchcore.sampler.ApproximateGreedyCoresetSampler(percentage, device)
+        else:
+            raise click.ClickException(f"Unknown sampler: {name}")
 
     return ("get_sampler", get_sampler)
 
@@ -556,7 +669,7 @@ def dataset(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    LOGGER.info("Command line arguments: {}".format(" ".join(sys.argv)))
+    LOGGER.info("Command line arguments: %s", " ".join(sys.argv))
     main()
 
 
