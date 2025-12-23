@@ -21,12 +21,95 @@ LOGGER = logging.getLogger(__name__)
 
 _DATASETS = {"mvtec": ["patchcore.datasets.mvtec", "MVTecDataset"]}
 
+# torchvision ImageNet default
+_DEFAULT_MEAN = [0.485, 0.456, 0.406]
+_DEFAULT_STD = [0.229, 0.224, 0.225]
+
+
+def _to_numpy(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _ensure_chw_uint8(img, mean, std):
+    """
+    plot_segmentation_images() は内部で image.transpose(1,2,0) をする前提なので、
+    ここは CHW (C,H,W) の uint8 を返す必要がある。
+    """
+    a = _to_numpy(img)
+
+    # ---- shape to CHW ----
+    if a.ndim == 2:
+        # (H,W) -> (1,H,W) -> (3,H,W)
+        a = a[None, :, :]
+        a = np.repeat(a, 3, axis=0)
+
+    elif a.ndim == 3:
+        # CHW: (C,H,W)
+        if a.shape[0] in (1, 3) and a.shape[1] > 8 and a.shape[2] > 8:
+            if a.shape[0] == 1:
+                a = np.repeat(a, 3, axis=0)
+
+        # HWC: (H,W,C) -> (C,H,W)
+        elif a.shape[-1] in (1, 3) and a.shape[0] > 8 and a.shape[1] > 8:
+            if a.shape[-1] == 1:
+                a = np.repeat(a, 3, axis=-1)
+            a = np.transpose(a, (2, 0, 1))
+
+        # H,C,W like: (H,3,W) -> (3,H,W)
+        elif a.shape[1] in (1, 3) and a.shape[0] > 8 and a.shape[2] > 8:
+            if a.shape[1] == 1:
+                a = np.repeat(a, 3, axis=1)
+            a = np.transpose(a, (1, 0, 2))
+
+        else:
+            raise ValueError(f"Unexpected image shape: {a.shape}")
+
+    else:
+        raise ValueError(f"Unexpected image ndim: {a.ndim}")
+
+    # ---- denormalize -> uint8 ----
+    mean = np.array(mean, dtype=np.float32).reshape(3, 1, 1)
+    std = np.array(std, dtype=np.float32).reshape(3, 1, 1)
+
+    a = a.astype(np.float32)
+    a = (a * std + mean) * 255.0
+    a = np.clip(a, 0, 255).astype(np.uint8)
+    return a
+
+
+def _ensure_hw_mask(mask):
+    """
+    plot_segmentation_images() が扱いやすいように mask を必ず (H,W) にする。
+    """
+    m = _to_numpy(mask)
+
+    if m.ndim == 2:
+        return m
+
+    if m.ndim == 3:
+        # (1,H,W) -> (H,W)
+        if m.shape[0] == 1 and m.shape[1] > 8 and m.shape[2] > 8:
+            return m[0]
+        # (3,H,W) -> (H,W) （RGBマスク等は1ch扱いに落とす）
+        if m.shape[0] == 3 and m.shape[1] > 8 and m.shape[2] > 8:
+            return m[0]
+        # (H,W,1) -> (H,W)
+        if m.shape[-1] == 1 and m.shape[0] > 8 and m.shape[1] > 8:
+            return m[:, :, 0]
+        # (H,W,3) -> (H,W)
+        if m.shape[-1] == 3 and m.shape[0] > 8 and m.shape[1] > 8:
+            return m[:, :, 0]
+
+    raise ValueError(f"Unexpected mask shape: {m.shape}")
+
 
 def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     """枚数ベース＋行正規化(%)の混同行列を保存する（どちらもBlues）。"""
     os.makedirs(save_dir, exist_ok=True)
 
-    # ===== 枚数ベース（counts）=====
+    # ===== counts =====
     fig, ax = plt.subplots()
     im = ax.imshow(cm, vmin=0, vmax=max(1, cm.max()), cmap="Blues")
     ax.set_xticks(range(len(class_names)))
@@ -41,11 +124,8 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
             ax.text(
-                j,
-                i,
-                str(cm[i, j]),
-                ha="center",
-                va="center",
+                j, i, str(cm[i, j]),
+                ha="center", va="center",
                 color="white" if cm[i, j] > vmax * 0.5 else "black",
             )
 
@@ -54,7 +134,7 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     fig.savefig(count_path, bbox_inches="tight", dpi=200)
     plt.close(fig)
 
-    # ===== 行方向で正規化(%) =====
+    # ===== row-normalized =====
     with np.errstate(divide="ignore", invalid="ignore"):
         denom = cm.sum(axis=1, keepdims=True)
         cm_norm = np.divide(
@@ -78,11 +158,8 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
         for j in range(cm_norm.shape[1]):
             val = cm_norm[i, j] * 100.0
             ax.text(
-                j,
-                i,
-                f"{val:.1f}",
-                ha="center",
-                va="center",
+                j, i, f"{val:.1f}",
+                ha="center", va="center",
                 color="white" if cm_norm[i, j] > 0.5 else "black",
             )
 
@@ -94,78 +171,6 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     LOGGER.info("Saved confusion matrices to:")
     LOGGER.info("  counts: %s", count_path)
     LOGGER.info("  norm  : %s", norm_path)
-
-
-def _to_numpy(x):
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
-
-
-def _ensure_hwc_uint8(img, mean, std):
-    """
-    入力が CHW/HWC/変なtranspose でも最終的に HWC(uint8) に揃える。
-    img は 0-1 正規化想定（datasetのtransform_img結果を想定）
-    """
-    a = _to_numpy(img)
-
-    # よくある: CHW
-    if a.ndim == 3 and a.shape[0] in (1, 3) and a.shape[1] > 8 and a.shape[2] > 8:
-        a = np.transpose(a, (1, 2, 0))  # HWC
-
-    # まれ: (H,3,W) のような崩れ
-    elif a.ndim == 3 and a.shape[1] in (1, 3) and a.shape[0] > 8 and a.shape[2] > 8:
-        a = np.transpose(a, (0, 2, 1))  # HWC へ
-
-    # さらにまれ: (W,H,3) のようなケースは何もしない（可視化としては致命的ではない）
-    # 必要ならここで追加対応
-
-    # グレースケール (H,W) -> (H,W,1)
-    if a.ndim == 2:
-        a = a[:, :, None]
-
-    # チャンネル数を 3 に寄せたい場合
-    if a.shape[2] == 1:
-        a = np.repeat(a, 3, axis=2)
-
-    mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
-    std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
-
-    # 逆正規化 -> 0-255
-    a = (a.astype(np.float32) * std + mean) * 255.0
-    a = np.clip(a, 0, 255).astype(np.uint8)
-    return a
-
-
-def _ensure_1chw_mask(mask):
-    """plot_segmentation_images が期待する (1,H,W) に強制変換。"""
-    m = _to_numpy(mask)
-
-    # (H,W)
-    if m.ndim == 2:
-        m = m[np.newaxis, :, :]
-
-    # (H,W,1) -> (1,H,W)
-    elif m.ndim == 3 and m.shape[-1] == 1:
-        m = np.transpose(m, (2, 0, 1))
-
-    # (3,H,W) -> (1,H,W)
-    elif m.ndim == 3 and m.shape[0] == 3:
-        m = m[0:1, :, :]
-
-    # (H,W,3) -> (1,H,W)
-    elif m.ndim == 3 and m.shape[-1] == 3:
-        m = np.transpose(m, (2, 0, 1))
-        m = m[0:1, :, :]
-
-    # (1,H,W) OK
-    elif m.ndim == 3 and m.shape[0] == 1:
-        pass
-
-    else:
-        raise ValueError(f"Unexpected mask shape after handling: {m.shape}")
-
-    return m
 
 
 @click.group(chain=True)
@@ -230,7 +235,7 @@ def run(
             if len(PatchCore_list) > 1:
                 LOGGER.info("Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list)))
 
-            # ===== 学習 =====
+            # ===== Training =====
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
                 if PatchCore.backbone.seed is not None:
@@ -238,18 +243,20 @@ def run(
                 LOGGER.info("Training models ({}/{})".format(i + 1, len(PatchCore_list)))
                 PatchCore.fit(dataloaders["training"])
 
-            # ===== 推論（test）=====
+            # ===== Inference (test) =====
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
 
+            labels_gt = None
+            masks_gt = None
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
                 LOGGER.info("Embedding test data with models ({}/{})".format(i + 1, len(PatchCore_list)))
-                scores, segmentations, labels_gt, masks_gt = PatchCore.predict(dataloaders["testing"])
-                aggregator["scores"].append(scores)
-                aggregator["segmentations"].append(segmentations)
+                scores_i, segmentations_i, labels_gt, masks_gt = PatchCore.predict(dataloaders["testing"])
+                aggregator["scores"].append(scores_i)
+                aggregator["segmentations"].append(segmentations_i)
 
-            # ===== Ensemble 正規化（元の公式処理に合わせる）=====
+            # ===== Ensemble normalization (official-like) =====
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
@@ -275,28 +282,28 @@ def run(
                 x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
             ]
 
-            # ===== ヒートマップ可視化（segmentation_images）=====
+            # ===== Heatmaps (segmentation_images) =====
             if save_segmentation_images:
                 ds = dataloaders["testing"].dataset
+
+                # datasetに無い場合のフォールバック
+                mean = getattr(ds, "transform_mean", _DEFAULT_MEAN)
+                std = getattr(ds, "transform_std", _DEFAULT_STD)
 
                 image_paths = [x[2] for x in ds.data_to_iterate]
                 mask_paths = [x[3] for x in ds.data_to_iterate]
 
-                # mean/std が dataset に無い場合でも落ちないようにフォールバック
-                mean = getattr(ds, "transform_mean", [0.485, 0.456, 0.406])
-                std = getattr(ds, "transform_std", [0.229, 0.224, 0.225])
-
                 def image_transform(image):
-                    # datasetにtransform_imgがある前提（無い場合はそのまま）
+                    # transform_img がある実装に対応
                     if hasattr(ds, "transform_img"):
                         image = ds.transform_img(image)
-                    return _ensure_hwc_uint8(image, mean=mean, std=std)
+                    return _ensure_chw_uint8(image, mean=mean, std=std)
 
                 def mask_transform(mask):
-                    # datasetにtransform_maskがある前提（無い場合はそのまま）
+                    # transform_mask がある実装に対応
                     if hasattr(ds, "transform_mask"):
                         mask = ds.transform_mask(mask)
-                    return _ensure_1chw_mask(mask)
+                    return _ensure_hw_mask(mask)
 
                 image_save_path = os.path.join(run_save_path, "segmentation_images", dataset_name)
                 os.makedirs(image_save_path, exist_ok=True)
@@ -312,7 +319,7 @@ def run(
                 )
                 LOGGER.info("Saved segmentation/heatmap images to: %s", image_save_path)
 
-            # ===== 評価指標 =====
+            # ===== Metrics =====
             LOGGER.info("Computing evaluation metrics.")
             image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(scores, anomaly_labels)
             auroc = image_metrics["auroc"]
@@ -342,11 +349,10 @@ def run(
                 if key != "dataset_name":
                     LOGGER.info("{0}: {1:3.3f}".format(key, item))
 
-            # ===== 混同行列 =====
+            # ===== Confusion matrix =====
             class_names = ["normal", "abnormal"]
             y_true = np.asarray(anomaly_labels, dtype=int)
 
-            # しきい値：metrics に optimal_threshold があればそれ、なければ95%tile
             threshold = image_metrics.get("optimal_threshold", float(np.percentile(scores, 95.0)))
             y_pred = (scores >= threshold).astype(int)
 
@@ -354,7 +360,7 @@ def run(
             cm_save_dir = os.path.join(run_save_path, "confusion_matrices")
             plot_confusion_matrices(cm, class_names, cm_save_dir, dataset_name)
 
-            # ===== テスト画像を normal / abnormal に仕分けコピー =====
+            # ===== Sort test images by prediction =====
             sorted_base = os.path.join(run_save_path, "sorted_images", dataset_name)
             normal_dir = os.path.join(sorted_base, "normal")
             abnormal_dir = os.path.join(sorted_base, "abnormal")
@@ -373,7 +379,7 @@ def run(
 
             LOGGER.info("Saved sorted images to: %s", sorted_base)
 
-            # ===== PatchCore モデル保存 =====
+            # ===== Save PatchCore model =====
             if save_patchcore_model:
                 patchcore_save_path = os.path.join(run_save_path, "models", dataset_name)
                 os.makedirs(patchcore_save_path, exist_ok=True)
@@ -387,7 +393,7 @@ def run(
 
         LOGGER.info("\n\n-----\n")
 
-    # ===== 全データセット結果をCSVに保存 =====
+    # ===== Store final results =====
     result_metric_names = list(result_collect[-1].keys())[1:]
     result_dataset_names = [results["dataset_name"] for results in result_collect]
     result_scores = [list(results.values())[1:] for results in result_collect]
@@ -582,5 +588,4 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     LOGGER.info("Command line arguments: {}".format(" ".join(sys.argv)))
     main()
-
 
