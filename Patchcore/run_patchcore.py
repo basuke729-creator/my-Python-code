@@ -96,6 +96,78 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     LOGGER.info("  norm  : %s", norm_path)
 
 
+def _to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _ensure_hwc_uint8(img, mean, std):
+    """
+    入力が CHW/HWC/変なtranspose でも最終的に HWC(uint8) に揃える。
+    img は 0-1 正規化想定（datasetのtransform_img結果を想定）
+    """
+    a = _to_numpy(img)
+
+    # よくある: CHW
+    if a.ndim == 3 and a.shape[0] in (1, 3) and a.shape[1] > 8 and a.shape[2] > 8:
+        a = np.transpose(a, (1, 2, 0))  # HWC
+
+    # まれ: (H,3,W) のような崩れ
+    elif a.ndim == 3 and a.shape[1] in (1, 3) and a.shape[0] > 8 and a.shape[2] > 8:
+        a = np.transpose(a, (0, 2, 1))  # HWC へ
+
+    # さらにまれ: (W,H,3) のようなケースは何もしない（可視化としては致命的ではない）
+    # 必要ならここで追加対応
+
+    # グレースケール (H,W) -> (H,W,1)
+    if a.ndim == 2:
+        a = a[:, :, None]
+
+    # チャンネル数を 3 に寄せたい場合
+    if a.shape[2] == 1:
+        a = np.repeat(a, 3, axis=2)
+
+    mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
+    std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
+
+    # 逆正規化 -> 0-255
+    a = (a.astype(np.float32) * std + mean) * 255.0
+    a = np.clip(a, 0, 255).astype(np.uint8)
+    return a
+
+
+def _ensure_1chw_mask(mask):
+    """plot_segmentation_images が期待する (1,H,W) に強制変換。"""
+    m = _to_numpy(mask)
+
+    # (H,W)
+    if m.ndim == 2:
+        m = m[np.newaxis, :, :]
+
+    # (H,W,1) -> (1,H,W)
+    elif m.ndim == 3 and m.shape[-1] == 1:
+        m = np.transpose(m, (2, 0, 1))
+
+    # (3,H,W) -> (1,H,W)
+    elif m.ndim == 3 and m.shape[0] == 3:
+        m = m[0:1, :, :]
+
+    # (H,W,3) -> (1,H,W)
+    elif m.ndim == 3 and m.shape[-1] == 3:
+        m = np.transpose(m, (2, 0, 1))
+        m = m[0:1, :, :]
+
+    # (1,H,W) OK
+    elif m.ndim == 3 and m.shape[0] == 1:
+        pass
+
+    else:
+        raise ValueError(f"Unexpected mask shape after handling: {m.shape}")
+
+    return m
+
+
 @click.group(chain=True)
 @click.argument("results_path", type=str)
 @click.option("--gpu", type=int, default=[0], multiple=True, show_default=True)
@@ -205,88 +277,26 @@ def run(
 
             # ===== ヒートマップ可視化（segmentation_images）=====
             if save_segmentation_images:
-                image_paths = [x[2] for x in dataloaders["testing"].dataset.data_to_iterate]
-                mask_paths = [x[3] for x in dataloaders["testing"].dataset.data_to_iterate]
-
                 ds = dataloaders["testing"].dataset
 
-                def _get_mean_std(dataset):
-                    """
-                    transform_mean/std が無い派生実装でも落ちないようにする。
-                    取れない場合は None を返して、un-normalize を諦める。
-                    """
-                    mean = getattr(dataset, "transform_mean", None)
-                    std = getattr(dataset, "transform_std", None)
-                    if mean is None or std is None:
-                        mean = getattr(dataset, "mean", None)
-                        std = getattr(dataset, "std", None)
-                    if mean is None or std is None:
-                        return None, None
-                    mean = np.asarray(mean, dtype=np.float32).reshape(-1, 1, 1)
-                    std = np.asarray(std, dtype=np.float32).reshape(-1, 1, 1)
-                    return mean, std
+                image_paths = [x[2] for x in ds.data_to_iterate]
+                mask_paths = [x[3] for x in ds.data_to_iterate]
 
-                mean, std = _get_mean_std(ds)
+                # mean/std が dataset に無い場合でも落ちないようにフォールバック
+                mean = getattr(ds, "transform_mean", [0.485, 0.456, 0.406])
+                std = getattr(ds, "transform_std", [0.229, 0.224, 0.225])
 
                 def image_transform(image):
-                    """
-                    patchcore.utils.plot_segmentation_images は
-                    image が CHW を期待して内部で transpose(1,2,0) する。
-                    → ここでは必ず CHW を返す。
-                    """
-                    img = ds.transform_img(image)  # 基本 torch.Tensor (C,H,W)
-                    if isinstance(img, torch.Tensor):
-                        img = img.detach().cpu()
-                        if img.ndim == 3:
-                            pass
-                        elif img.ndim == 4 and img.shape[0] == 1:
-                            img = img[0]
-                        else:
-                            raise ValueError(f"Unexpected transformed image shape: {tuple(img.shape)}")
-                        img_np = img.numpy()
-                    else:
-                        img_np = np.asarray(img)
-                        # HWC の場合は CHW にする
-                        if img_np.ndim == 3 and img_np.shape[-1] in (1, 3):
-                            img_np = np.transpose(img_np, (2, 0, 1))
-
-                    # un-normalize が可能なら戻す
-                    if mean is not None and std is not None and img_np.shape[0] == mean.shape[0]:
-                        img_np = (img_np * std + mean)
-
-                    # 0-255 uint8 へ
-                    img_np = np.clip(img_np * 255.0, 0.0, 255.0).astype(np.uint8)
-
-                    # 必ず CHW
-                    if img_np.ndim != 3:
-                        raise ValueError(f"image_transform must return CHW, got shape={img_np.shape}")
-                    return img_np
+                    # datasetにtransform_imgがある前提（無い場合はそのまま）
+                    if hasattr(ds, "transform_img"):
+                        image = ds.transform_img(image)
+                    return _ensure_hwc_uint8(image, mean=mean, std=std)
 
                 def mask_transform(mask):
-                    """
-                    patchcore.utils.plot_segmentation_images は
-                    mask が (1,H,W) を期待して内部で transpose(1,2,0) する。
-                    → ここでは必ず (1,H,W) を返す。
-                    """
-                    m = ds.transform_mask(mask)
-                    if isinstance(m, torch.Tensor):
-                        m = m.detach().cpu().numpy()
-                    else:
-                        m = np.asarray(m)
-
-                    # (H,W) -> (1,H,W)
-                    if m.ndim == 2:
-                        m = m[np.newaxis, :, :]
-                    # (H,W,1) -> (1,H,W)
-                    elif m.ndim == 3 and m.shape[-1] == 1:
-                        m = np.transpose(m, (2, 0, 1))
-                    # (1,H,W) OK
-                    elif m.ndim == 3 and m.shape[0] == 1:
-                        pass
-                    else:
-                        raise ValueError(f"Unexpected mask shape: {m.shape}")
-
-                    return m
+                    # datasetにtransform_maskがある前提（無い場合はそのまま）
+                    if hasattr(ds, "transform_mask"):
+                        mask = ds.transform_mask(mask)
+                    return _ensure_1chw_mask(mask)
 
                 image_save_path = os.path.join(run_save_path, "segmentation_images", dataset_name)
                 os.makedirs(image_save_path, exist_ok=True)
@@ -336,6 +346,7 @@ def run(
             class_names = ["normal", "abnormal"]
             y_true = np.asarray(anomaly_labels, dtype=int)
 
+            # しきい値：metrics に optimal_threshold があればそれ、なければ95%tile
             threshold = image_metrics.get("optimal_threshold", float(np.percentile(scores, 95.0)))
             y_pred = (scores >= threshold).astype(int)
 
