@@ -41,23 +41,22 @@ def _ensure_chw_uint8(img, mean, std):
 
     # ---- shape to CHW ----
     if a.ndim == 2:
-        # (H,W) -> (1,H,W) -> (3,H,W)
         a = a[None, :, :]
         a = np.repeat(a, 3, axis=0)
 
     elif a.ndim == 3:
-        # CHW: (C,H,W)
+        # CHW
         if a.shape[0] in (1, 3) and a.shape[1] > 8 and a.shape[2] > 8:
             if a.shape[0] == 1:
                 a = np.repeat(a, 3, axis=0)
 
-        # HWC: (H,W,C) -> (C,H,W)
+        # HWC -> CHW
         elif a.shape[-1] in (1, 3) and a.shape[0] > 8 and a.shape[1] > 8:
             if a.shape[-1] == 1:
                 a = np.repeat(a, 3, axis=-1)
             a = np.transpose(a, (2, 0, 1))
 
-        # H,C,W like: (H,3,W) -> (3,H,W)
+        # H,C,W -> CHW
         elif a.shape[1] in (1, 3) and a.shape[0] > 8 and a.shape[2] > 8:
             if a.shape[1] == 1:
                 a = np.repeat(a, 3, axis=1)
@@ -79,37 +78,34 @@ def _ensure_chw_uint8(img, mean, std):
     return a
 
 
-def _ensure_hw_mask(mask):
+def _ensure_chw_mask(mask):
     """
-    plot_segmentation_images() が扱いやすいように mask を必ず (H,W) にする。
+    patchcore.utils.plot_segmentation_images() は内部で mask.transpose(1,2,0) をするため、
+    mask_transform は必ず CHW (C,H,W) を返す必要がある。
+    C=1 でOK。
     """
     m = _to_numpy(mask)
 
     if m.ndim == 2:
-        return m
+        # (H,W) -> (1,H,W)
+        return m[None, :, :]
 
     if m.ndim == 3:
-        # (1,H,W) -> (H,W)
-        if m.shape[0] == 1 and m.shape[1] > 8 and m.shape[2] > 8:
-            return m[0]
-        # (3,H,W) -> (H,W) （RGBマスク等は1ch扱いに落とす）
-        if m.shape[0] == 3 and m.shape[1] > 8 and m.shape[2] > 8:
-            return m[0]
-        # (H,W,1) -> (H,W)
-        if m.shape[-1] == 1 and m.shape[0] > 8 and m.shape[1] > 8:
-            return m[:, :, 0]
-        # (H,W,3) -> (H,W)
-        if m.shape[-1] == 3 and m.shape[0] > 8 and m.shape[1] > 8:
-            return m[:, :, 0]
+        # CHW (1,H,W) or (3,H,W)
+        if m.shape[0] in (1, 3) and m.shape[1] > 8 and m.shape[2] > 8:
+            return m
+
+        # HWC (H,W,1 or 3) -> CHW
+        if m.shape[-1] in (1, 3) and m.shape[0] > 8 and m.shape[1] > 8:
+            return np.transpose(m, (2, 0, 1))
 
     raise ValueError(f"Unexpected mask shape: {m.shape}")
 
 
 def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
-    """枚数ベース＋行正規化(%)の混同行列を保存する（どちらもBlues）。"""
     os.makedirs(save_dir, exist_ok=True)
 
-    # ===== counts =====
+    # counts
     fig, ax = plt.subplots()
     im = ax.imshow(cm, vmin=0, vmax=max(1, cm.max()), cmap="Blues")
     ax.set_xticks(range(len(class_names)))
@@ -134,7 +130,7 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
     fig.savefig(count_path, bbox_inches="tight", dpi=200)
     plt.close(fig)
 
-    # ===== row-normalized =====
+    # row-normalized
     with np.errstate(divide="ignore", invalid="ignore"):
         denom = cm.sum(axis=1, keepdims=True)
         cm_norm = np.divide(
@@ -179,23 +175,14 @@ def plot_confusion_matrices(cm, class_names, save_dir, dataset_name):
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--log_group", type=str, default="group")
 @click.option("--log_project", type=str, default="project")
-@click.option("--save_segmentation_images", is_flag=True, help="ヒートマップ(セグメンテーション画像)を保存する")
+@click.option("--save_segmentation_images", is_flag=True)
 @click.option("--save_patchcore_model", is_flag=True)
 def main(**kwargs):
     pass
 
 
 @main.result_callback()
-def run(
-    methods,
-    results_path,
-    gpu,
-    seed,
-    log_group,
-    log_project,
-    save_segmentation_images,
-    save_patchcore_model,
-):
+def run(methods, results_path, gpu, seed, log_group, log_project, save_segmentation_images, save_patchcore_model):
     methods = {key: item for (key, item) in methods}
 
     run_save_path = patchcore.utils.create_storage_folder(
@@ -232,10 +219,7 @@ def run(
             sampler = methods["get_sampler"](device)
             PatchCore_list = methods["get_patchcore"](imagesize, sampler, device)
 
-            if len(PatchCore_list) > 1:
-                LOGGER.info("Utilizing PatchCore Ensemble (N={}).".format(len(PatchCore_list)))
-
-            # ===== Training =====
+            # Training
             for i, PatchCore in enumerate(PatchCore_list):
                 torch.cuda.empty_cache()
                 if PatchCore.backbone.seed is not None:
@@ -243,7 +227,7 @@ def run(
                 LOGGER.info("Training models ({}/{})".format(i + 1, len(PatchCore_list)))
                 PatchCore.fit(dataloaders["training"])
 
-            # ===== Inference (test) =====
+            # Inference
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
 
@@ -256,7 +240,7 @@ def run(
                 aggregator["scores"].append(scores_i)
                 aggregator["segmentations"].append(segmentations_i)
 
-            # ===== Ensemble normalization (official-like) =====
+            # Ensemble normalization
             scores = np.array(aggregator["scores"])
             min_scores = scores.min(axis=-1).reshape(-1, 1)
             max_scores = scores.max(axis=-1).reshape(-1, 1)
@@ -264,29 +248,16 @@ def run(
             scores = np.mean(scores, axis=0)
 
             segmentations = np.array(aggregator["segmentations"])
-            min_scores = (
-                segmentations.reshape(len(segmentations), -1)
-                .min(axis=-1)
-                .reshape(-1, 1, 1, 1)
-            )
-            max_scores = (
-                segmentations.reshape(len(segmentations), -1)
-                .max(axis=-1)
-                .reshape(-1, 1, 1, 1)
-            )
+            min_scores = segmentations.reshape(len(segmentations), -1).min(axis=-1).reshape(-1, 1, 1, 1)
+            max_scores = segmentations.reshape(len(segmentations), -1).max(axis=-1).reshape(-1, 1, 1, 1)
             segmentations = (segmentations - min_scores) / (max_scores - min_scores + 1e-12)
             segmentations = np.mean(segmentations, axis=0)
 
-            # True label（"good" 以外を異常扱い）
-            anomaly_labels = [
-                x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
-            ]
+            anomaly_labels = [x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate]
 
-            # ===== Heatmaps (segmentation_images) =====
+            # Heatmaps
             if save_segmentation_images:
                 ds = dataloaders["testing"].dataset
-
-                # datasetに無い場合のフォールバック
                 mean = getattr(ds, "transform_mean", _DEFAULT_MEAN)
                 std = getattr(ds, "transform_std", _DEFAULT_STD)
 
@@ -294,16 +265,14 @@ def run(
                 mask_paths = [x[3] for x in ds.data_to_iterate]
 
                 def image_transform(image):
-                    # transform_img がある実装に対応
                     if hasattr(ds, "transform_img"):
                         image = ds.transform_img(image)
                     return _ensure_chw_uint8(image, mean=mean, std=std)
 
                 def mask_transform(mask):
-                    # transform_mask がある実装に対応
                     if hasattr(ds, "transform_mask"):
                         mask = ds.transform_mask(mask)
-                    return _ensure_hw_mask(mask)
+                    return _ensure_chw_mask(mask)  # ★ここが今回の修正点（CHW固定）
 
                 image_save_path = os.path.join(run_save_path, "segmentation_images", dataset_name)
                 os.makedirs(image_save_path, exist_ok=True)
@@ -319,7 +288,7 @@ def run(
                 )
                 LOGGER.info("Saved segmentation/heatmap images to: %s", image_save_path)
 
-            # ===== Metrics =====
+            # Metrics
             LOGGER.info("Computing evaluation metrics.")
             image_metrics = patchcore.metrics.compute_imagewise_retrieval_metrics(scores, anomaly_labels)
             auroc = image_metrics["auroc"]
@@ -349,7 +318,7 @@ def run(
                 if key != "dataset_name":
                     LOGGER.info("{0}: {1:3.3f}".format(key, item))
 
-            # ===== Confusion matrix =====
+            # Confusion matrix
             class_names = ["normal", "abnormal"]
             y_true = np.asarray(anomaly_labels, dtype=int)
 
@@ -360,7 +329,7 @@ def run(
             cm_save_dir = os.path.join(run_save_path, "confusion_matrices")
             plot_confusion_matrices(cm, class_names, cm_save_dir, dataset_name)
 
-            # ===== Sort test images by prediction =====
+            # Sort images
             sorted_base = os.path.join(run_save_path, "sorted_images", dataset_name)
             normal_dir = os.path.join(sorted_base, "normal")
             abnormal_dir = os.path.join(sorted_base, "abnormal")
@@ -379,7 +348,7 @@ def run(
 
             LOGGER.info("Saved sorted images to: %s", sorted_base)
 
-            # ===== Save PatchCore model =====
+            # Save model
             if save_patchcore_model:
                 patchcore_save_path = os.path.join(run_save_path, "models", dataset_name)
                 os.makedirs(patchcore_save_path, exist_ok=True)
@@ -393,7 +362,7 @@ def run(
 
         LOGGER.info("\n\n-----\n")
 
-    # ===== Store final results =====
+    # Store final results
     result_metric_names = list(result_collect[-1].keys())[1:]
     result_dataset_names = [results["dataset_name"] for results in result_collect]
     result_scores = [list(results.values())[1:] for results in result_collect]
@@ -588,4 +557,5 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     LOGGER.info("Command line arguments: {}".format(" ".join(sys.argv)))
     main()
+
 
