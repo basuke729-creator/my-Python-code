@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 import contextlib
 import logging
-import os
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import click
 import numpy as np
@@ -37,55 +35,6 @@ def _move_to_device(obj, device: torch.device):
     return obj
 
 
-def _extract_images(batch):
-    if torch.is_tensor(batch):
-        return batch
-    if isinstance(batch, (list, tuple)):
-        return batch[0]
-    if isinstance(batch, dict):
-        if "image" in batch:
-            return batch["image"]
-        if "images" in batch:
-            return batch["images"]
-    raise TypeError(f"Unsupported batch type: {type(batch)}")
-
-
-def _predict_over_loader(pc, loader, device: torch.device, exclude_h2d: bool):
-    scores_acc = []
-    segs_acc = []
-    labels_gt = None
-    masks_gt = None
-
-    for batch in loader:
-        images = _extract_images(batch)
-
-        if not torch.is_tensor(images):
-            raise TypeError(f"Extracted images is not a Tensor: {type(images)}")
-
-        if images.dtype != torch.float32:
-            images = images.to(dtype=torch.float32)
-
-        if not exclude_h2d:
-            if images.device != device:
-                images = images.to(device, non_blocking=True)
-
-        out = pc.predict(images)
-
-        if isinstance(out, (tuple, list)):
-            if len(out) >= 2:
-                scores_i = out[0]
-                segs_i = out[1]
-                scores_acc.append(scores_i)
-                segs_acc.append(segs_i)
-            if len(out) >= 4:
-                labels_gt = out[2]
-                masks_gt = out[3]
-        else:
-            scores_acc.append(out)
-
-    return scores_acc, segs_acc, labels_gt, masks_gt
-
-
 class _CachedLoader:
     def __init__(self, batches, dataset=None, name="cached"):
         self._batches = batches
@@ -102,6 +51,9 @@ class _CachedLoader:
 def _resolve_model_subdirs(model_dir: Path):
     model_dir = Path(model_dir)
     if model_dir.is_file():
+        # if a file is given, assume it is patchcore_params.pkl and use its parent
+        if model_dir.name == "patchcore_params.pkl":
+            return [model_dir.parent]
         return [model_dir]
 
     pkl_files = sorted(model_dir.rglob("patchcore_params.pkl"))
@@ -204,6 +156,8 @@ def run(
     bench_exclude_h2d,
 ):
     methods = {k: v for (k, v) in methods}
+    if "get_dataloaders" not in methods:
+        raise click.ClickException("Missing required command: dataset (get_dataloaders).")
 
     run_save_path = patchcore.utils.create_storage_folder(
         results_path, log_project, log_group, mode="iterate"
@@ -230,7 +184,12 @@ def run(
 
         for dataloader_count, dataloaders in enumerate(list_of_dataloaders):
             dataset_name = dataloaders["testing"].name
-            LOGGER.info("Benchmarking dataset [%s] (%d/%d)...", dataset_name, dataloader_count + 1, len(list_of_dataloaders))
+            LOGGER.info(
+                "Benchmarking dataset [%s] (%d/%d)...",
+                dataset_name,
+                dataloader_count + 1,
+                len(list_of_dataloaders),
+            )
 
             test_loader = dataloaders["testing"]
 
@@ -250,13 +209,19 @@ def run(
                 warm_loader = test_loader
                 meas_loader = test_loader
 
-            LOGGER.info("[BENCH] Start: iters=%d warmup=%d image_index=%d exclude_io=%s exclude_h2d=%s",
-                        bench_iters, bench_warmup, bench_image_index, bench_exclude_io, bench_exclude_h2d)
+            LOGGER.info(
+                "[BENCH] Start: iters=%d warmup=%d image_index=%d exclude_io=%s exclude_h2d=%s",
+                bench_iters,
+                bench_warmup,
+                bench_image_index,
+                bench_exclude_io,
+                bench_exclude_h2d,
+            )
 
             with torch.no_grad():
                 _sync(device)
                 t0_w = time.perf_counter()
-                _predict_over_loader(PatchCore_list[0], warm_loader, device=device, exclude_h2d=bench_exclude_h2d)
+                _ = PatchCore_list[0].predict(warm_loader)
                 _sync(device)
                 t1_w = time.perf_counter()
                 warm_ms = (t1_w - t0_w) * 1000.0 / max(1, len(warm_loader))
@@ -270,9 +235,7 @@ def run(
                 labels_gt = None
                 masks_gt = None
                 for pc in PatchCore_list:
-                    scores_i, segs_i, labels_gt, masks_gt = _predict_over_loader(
-                        pc, meas_loader, device=device, exclude_h2d=bench_exclude_h2d
-                    )
+                    scores_i, segs_i, labels_gt, masks_gt = pc.predict(meas_loader)
                     scores_list.append(scores_i)
                     segs_list.append(segs_i)
 
@@ -290,18 +253,55 @@ def run(
 
             out_txt = Path(run_save_path) / f"bench_{dataset_name}.txt"
             out_txt.write_text(
-                "\n".join([
-                    f"dataset={dataset_name}",
-                    f"exclude_io={bench_exclude_io}",
-                    f"exclude_h2d={bench_exclude_h2d}",
-                    f"warmup_n={len(warm_loader) if bench_exclude_io else bench_warmup}",
-                    f"measured_n={n_meas}",
-                    f"warmup_ms_per_image={warm_ms:.6f}",
-                    f"mean_ms_per_image={mean_ms:.6f}",
-                    f"fps={fps:.6f}",
-                ]) + "\n",
+                "\n".join(
+                    [
+                        f"dataset={dataset_name}",
+                        f"exclude_io={bench_exclude_io}",
+                        f"exclude_h2d={bench_exclude_h2d}",
+                        f"warmup_n={len(warm_loader) if bench_exclude_io else bench_warmup}",
+                        f"measured_n={n_meas}",
+                        f"warmup_ms_per_image={warm_ms:.6f}",
+                        f"mean_ms_per_image={mean_ms:.6f}",
+                        f"fps={fps:.6f}",
+                    ]
+                )
+                + "\n",
                 encoding="utf-8",
             )
+
+
+@main.command("patch_core")
+@click.option("-b", "--backbone", type=str, default="wideresnet50")
+@click.option("-le", "--layers_to_extract_from", multiple=True, type=str)
+@click.option("--pretrain_embed_dimension", type=int, default=1024)
+@click.option("--target_embed_dimension", type=int, default=1024)
+@click.option("--anomaly_scorer_num_nn", type=int, default=10)
+@click.option("--patchsize", type=int, default=3)
+def patch_core(
+    backbone,
+    layers_to_extract_from,
+    pretrain_embed_dimension,
+    target_embed_dimension,
+    anomaly_scorer_num_nn,
+    patchsize,
+):
+    # Kept for CLI compatibility with existing .sh (not used in this benchmark script).
+    return ("patch_core_args", dict(
+        backbone=backbone,
+        layers_to_extract_from=list(layers_to_extract_from),
+        pretrain_embed_dimension=pretrain_embed_dimension,
+        target_embed_dimension=target_embed_dimension,
+        anomaly_scorer_num_nn=anomaly_scorer_num_nn,
+        patchsize=patchsize,
+    ))
+
+
+@main.command("sampler")
+@click.argument("name", type=str)
+@click.option("-p", "--percentage", type=float, default=0.1, show_default=True)
+def sampler(name, percentage):
+    # Kept for CLI compatibility with existing .sh (not used in this benchmark script).
+    return ("sampler_args", dict(name=name, percentage=percentage))
 
 
 @main.command("dataset")
