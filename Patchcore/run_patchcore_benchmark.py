@@ -35,23 +35,9 @@ def _move_to_device(obj, device: torch.device):
     return obj
 
 
-class _CachedLoader:
-    def __init__(self, batches, dataset=None, name="cached"):
-        self._batches = batches
-        self.dataset = dataset
-        self.name = name
-
-    def __iter__(self):
-        return iter(self._batches)
-
-    def __len__(self):
-        return len(self._batches)
-
-
 def _resolve_model_subdirs(model_dir: Path):
     model_dir = Path(model_dir)
     if model_dir.is_file():
-        # if a file is given, assume it is patchcore_params.pkl and use its parent
         if model_dir.name == "patchcore_params.pkl":
             return [model_dir.parent]
         return [model_dir]
@@ -80,21 +66,6 @@ def _load_patchcore_ensemble(model_dir: Path, device: torch.device, nn_method):
     return pcs
 
 
-def _ensemble_normalize_and_mean(scores_list, segs_list):
-    scores = np.array(scores_list)
-    min_scores = scores.min(axis=-1).reshape(-1, 1)
-    max_scores = scores.max(axis=-1).reshape(-1, 1)
-    scores = (scores - min_scores) / (max_scores - min_scores + 1e-12)
-    scores = np.mean(scores, axis=0)
-
-    segs = np.array(segs_list)
-    min_scores = segs.reshape(len(segs), -1).min(axis=-1).reshape(-1, 1, 1, 1)
-    max_scores = segs.reshape(len(segs), -1).max(axis=-1).reshape(-1, 1, 1, 1)
-    segs = (segs - min_scores) / (max_scores - min_scores + 1e-12)
-    segs = np.mean(segs, axis=0)
-    return scores, segs
-
-
 def _collect_batches_for_benchmark(dataloader, bench_iters: int, bench_image_index: int, device, exclude_h2d: bool):
     it = iter(dataloader)
 
@@ -118,6 +89,15 @@ def _collect_batches_for_benchmark(dataloader, bench_iters: int, bench_image_ind
         batches.append(b)
 
     return batches
+
+
+def _predict_one(pc, batch_or_tensor):
+    return pc.predict(batch_or_tensor)
+
+
+def _predict_many(pc, data):
+    for b in data:
+        _ = _predict_one(pc, b)
 
 
 @click.group(chain=True)
@@ -201,13 +181,11 @@ def run(
                     device=device,
                     exclude_h2d=bench_exclude_h2d,
                 )
-                warm_batches = cached[:bench_warmup]
-                meas_batches = cached[bench_warmup:]
-                warm_loader = _CachedLoader(warm_batches, dataset=test_loader.dataset, name=test_loader.name)
-                meas_loader = _CachedLoader(meas_batches, dataset=test_loader.dataset, name=test_loader.name)
+                warm_data = cached[:bench_warmup]
+                meas_data = cached[bench_warmup:]
             else:
-                warm_loader = test_loader
-                meas_loader = test_loader
+                warm_data = test_loader
+                meas_data = test_loader
 
             LOGGER.info(
                 "[BENCH] Start: iters=%d warmup=%d image_index=%d exclude_io=%s exclude_h2d=%s",
@@ -221,29 +199,33 @@ def run(
             with torch.no_grad():
                 _sync(device)
                 t0_w = time.perf_counter()
-                _ = PatchCore_list[0].predict(warm_loader)
+                if bench_exclude_io:
+                    _predict_many(PatchCore_list[0], warm_data)
+                    warm_n = len(warm_data)
+                else:
+                    _ = PatchCore_list[0].predict(warm_data)
+                    warm_n = max(1, bench_warmup)
                 _sync(device)
                 t1_w = time.perf_counter()
-                warm_ms = (t1_w - t0_w) * 1000.0 / max(1, len(warm_loader))
-                LOGGER.info("[BENCH] warmup mean: %.3f ms / image (n=%d)", warm_ms, len(warm_loader))
+                warm_ms = (t1_w - t0_w) * 1000.0 / max(1, warm_n)
+                LOGGER.info("[BENCH] warmup mean: %.3f ms / image (n=%d)", warm_ms, warm_n)
 
                 _sync(device)
                 t0 = time.perf_counter()
 
-                scores_list = []
-                segs_list = []
-                labels_gt = None
-                masks_gt = None
-                for pc in PatchCore_list:
-                    scores_i, segs_i, labels_gt, masks_gt = pc.predict(meas_loader)
-                    scores_list.append(scores_i)
-                    segs_list.append(segs_i)
+                if bench_exclude_io:
+                    for pc in PatchCore_list:
+                        _predict_many(pc, meas_data)
+                    n_meas = len(meas_data)
+                else:
+                    for pc in PatchCore_list:
+                        _ = pc.predict(meas_data)
+                    n_meas = len(meas_data)
 
                 _sync(device)
                 t1 = time.perf_counter()
 
             total_s = (t1 - t0)
-            n_meas = len(meas_loader)
             mean_ms = (total_s * 1000.0) / max(1, n_meas)
             fps = max(1e-12, n_meas / max(1e-12, total_s))
 
@@ -258,7 +240,7 @@ def run(
                         f"dataset={dataset_name}",
                         f"exclude_io={bench_exclude_io}",
                         f"exclude_h2d={bench_exclude_h2d}",
-                        f"warmup_n={len(warm_loader) if bench_exclude_io else bench_warmup}",
+                        f"warmup_n={warm_n}",
                         f"measured_n={n_meas}",
                         f"warmup_ms_per_image={warm_ms:.6f}",
                         f"mean_ms_per_image={mean_ms:.6f}",
@@ -285,22 +267,23 @@ def patch_core(
     anomaly_scorer_num_nn,
     patchsize,
 ):
-    # Kept for CLI compatibility with existing .sh (not used in this benchmark script).
-    return ("patch_core_args", dict(
-        backbone=backbone,
-        layers_to_extract_from=list(layers_to_extract_from),
-        pretrain_embed_dimension=pretrain_embed_dimension,
-        target_embed_dimension=target_embed_dimension,
-        anomaly_scorer_num_nn=anomaly_scorer_num_nn,
-        patchsize=patchsize,
-    ))
+    return (
+        "patch_core_args",
+        dict(
+            backbone=backbone,
+            layers_to_extract_from=list(layers_to_extract_from),
+            pretrain_embed_dimension=pretrain_embed_dimension,
+            target_embed_dimension=target_embed_dimension,
+            anomaly_scorer_num_nn=anomaly_scorer_num_nn,
+            patchsize=patchsize,
+        ),
+    )
 
 
 @main.command("sampler")
 @click.argument("name", type=str)
 @click.option("-p", "--percentage", type=float, default=0.1, show_default=True)
 def sampler(name, percentage):
-    # Kept for CLI compatibility with existing .sh (not used in this benchmark script).
     return ("sampler_args", dict(name=name, percentage=percentage))
 
 
