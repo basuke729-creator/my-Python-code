@@ -91,8 +91,36 @@ def _collect_batches_for_benchmark(dataloader, bench_iters: int, bench_image_ind
     return batches
 
 
+def _extract_images_from_batch(batch_or_tensor):
+    if torch.is_tensor(batch_or_tensor):
+        return batch_or_tensor
+
+    if isinstance(batch_or_tensor, dict):
+        for k in ("image", "images", "img", "data", "input"):
+            v = batch_or_tensor.get(k, None)
+            if torch.is_tensor(v):
+                return v
+        for v in batch_or_tensor.values():
+            if torch.is_tensor(v):
+                return v
+        raise TypeError(f"Batch dict has no tensor values. keys={list(batch_or_tensor.keys())}")
+
+    if isinstance(batch_or_tensor, (list, tuple)):
+        if len(batch_or_tensor) == 0:
+            raise TypeError("Empty batch tuple/list.")
+        if torch.is_tensor(batch_or_tensor[0]):
+            return batch_or_tensor[0]
+        for v in batch_or_tensor:
+            if torch.is_tensor(v):
+                return v
+        raise TypeError("Batch tuple/list has no tensor values.")
+
+    raise TypeError(f"Unsupported batch type: {type(batch_or_tensor)}")
+
+
 def _predict_one(pc, batch_or_tensor):
-    return pc.predict(batch_or_tensor)
+    images = _extract_images_from_batch(batch_or_tensor)
+    return pc.predict(images)
 
 
 def _predict_many(pc, data):
@@ -367,6 +395,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     LOGGER.info("Command line arguments: %s", " ".join(sys.argv))
     main()
+
 
 
 
