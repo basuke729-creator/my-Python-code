@@ -1,31 +1,31 @@
 # ------------------------------------------------------------------
 # SimpleNet: A Simple Network for Image Anomaly Detection and Localization
+# (https://openaccess.thecvf.com/content/CVPR2023/papers/Liu_SimpleNet_A_Simple_Network_for_Image_Anomaly_Detection_and_Localization_CVPR_2023_paper.pdf)
 # Github source: https://github.com/DonaldRR/SimpleNet
+# Licensed under the MIT License [see LICENSE for details]
+# The script is based on the code of PatchCore (https://github.com/amazon-science/patchcore-inspection)
 # ------------------------------------------------------------------
 
 """detection methods."""
 import logging
 import os
 import pickle
+import math
+import shutil
 from collections import OrderedDict
 
-import math
 import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
-# 追加（出力機能）
-import shutil
-from pathlib import Path
-import pandas as pd
-from sklearn.metrics import confusion_matrix
-import matplotlib.pyplot as plt
-
 import common
 import metrics
 from utils import plot_segmentation_images
+
+# ★追加：混同行列保存関数（utils.pyに追記してある前提）
+from utils import save_confusion_matrices
 
 LOGGER = logging.getLogger(__name__)
 
@@ -107,26 +107,26 @@ class SimpleNet(torch.nn.Module):
         layers_to_extract_from,
         device,
         input_shape,
-        pretrain_embed_dimension,
-        target_embed_dimension,
-        patchsize=3,
+        pretrain_embed_dimension,  # 1536
+        target_embed_dimension,  # 1536
+        patchsize=3,  # 3
         patchstride=1,
-        embedding_size=None,
-        meta_epochs=1,
+        embedding_size=None,  # 256
+        meta_epochs=1,  # 40
         aed_meta_epochs=1,
-        gan_epochs=1,
+        gan_epochs=1,  # 4
         noise_std=0.05,
         mix_noise=1,
         noise_type="GAU",
-        dsc_layers=2,
-        dsc_hidden=None,
-        dsc_margin=0.8,
+        dsc_layers=2,  # 2
+        dsc_hidden=None,  # 1024
+        dsc_margin=0.8,  # .5
         dsc_lr=0.0002,
         train_backbone=False,
         auto_noise=0,
         cos_lr=False,
         lr=1e-3,
-        pre_proj=0,
+        pre_proj=0,  # 1
         proj_layer_type=0,
         **kwargs,
     ):
@@ -182,7 +182,6 @@ class SimpleNet(torch.nn.Module):
             self.pre_projection.to(self.device)
             self.proj_opt = torch.optim.AdamW(self.pre_projection.parameters(), lr * 0.1)
 
-        # Discriminator
         self.auto_noise = [auto_noise, None]
         self.dsc_lr = dsc_lr
         self.gan_epochs = gan_epochs
@@ -229,6 +228,7 @@ class SimpleNet(torch.nn.Module):
 
     def _embed(self, images, detach=True, provide_patch_shapes=False, evaluation=False):
         """Returns feature embeddings for images."""
+        B = len(images)
         if not evaluation and self.train_backbone:
             self.forward_modules["feature_aggregator"].train()
             features = self.forward_modules["feature_aggregator"](images, eval=evaluation)
@@ -283,104 +283,39 @@ class SimpleNet(torch.nn.Module):
 
         return features, patch_shapes
 
-    # ============================
-    # Export helpers
-    # ============================
-    def _export_predictions(
-        self,
-        scores_1d: np.ndarray,
-        labels_gt_1d: np.ndarray,
-        img_paths: list,
-        split_name: str = "test",
-        threshold: float | None = None,
-    ):
-        """Export per-image scores CSV, confusion matrix, and sorted images."""
-        export_dir = Path(self.ckpt_dir) / "exports"
-        export_dir.mkdir(parents=True, exist_ok=True)
+    # -----------------------------
+    # ★追加：画像スコアの最適閾値（F1最大）を計算
+    # -----------------------------
+    @staticmethod
+    def _compute_best_threshold_f1(y_true, y_score):
+        """
+        y_true: 0/1
+        y_score: anomaly score (higher => abnormal)
+        return: best_threshold(float), best_f1(float)
+        """
+        y_true = np.asarray(y_true).astype(int)
+        y_score = np.asarray(y_score).astype(float)
 
-        y_true = np.asarray(labels_gt_1d).astype(int).reshape(-1)
-        y_score = np.asarray(scores_1d).astype(float).reshape(-1)
-
-        # choose threshold
-        if threshold is None:
-            m = metrics.compute_imagewise_retrieval_metrics(y_score, y_true)
-            threshold = m.get("best_threshold_f1", None)
-            if threshold is None:
-                threshold = float(np.median(y_score))
-
-        y_pred = (y_score >= float(threshold)).astype(int)
-
-        # scores csv
-        if img_paths is None:
-            img_paths = [""] * len(y_score)
-
-        df = pd.DataFrame(
-            {
-                "image_path": img_paths,
-                "y_true": y_true,
-                "score": y_score,
-                "threshold": float(threshold),
-                "y_pred": y_pred,
-            }
+        precision, recall, thresholds = metrics.metrics.precision_recall_curve(
+            y_true, y_score
         )
-        df.to_csv(export_dir / f"scores_{split_name}.csv", index=False)
+        # thresholds は len-1 なので合わせる
+        # precision/recall は len(thresholds)+1
+        f1 = np.zeros_like(precision)
+        denom = precision + recall
+        valid = denom > 0
+        f1[valid] = 2 * precision[valid] * recall[valid] / denom[valid]
 
-        # confusion matrix csv
-        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-        cm_df = pd.DataFrame(
-            cm,
-            index=["true_normal(0)", "true_abnormal(1)"],
-            columns=["pred_normal(0)", "pred_abnormal(1)"],
-        )
-        cm_df.to_csv(export_dir / f"confusion_matrix_{split_name}.csv", index=True)
+        if thresholds is None or len(thresholds) == 0:
+            return 0.5, 0.0
 
-        # confusion matrix png (optional)
-        try:
-            fig = plt.figure()
-            plt.imshow(cm, interpolation="nearest")
-            plt.title(f"Confusion Matrix ({split_name}) thr={float(threshold):.4f}")
-            plt.colorbar()
-            tick_marks = np.arange(2)
-            plt.xticks(tick_marks, ["pred0", "pred1"])
-            plt.yticks(tick_marks, ["true0", "true1"])
-            for i in range(2):
-                for j in range(2):
-                    plt.text(j, i, str(cm[i, j]), ha="center", va="center")
-            plt.ylabel("True")
-            plt.xlabel("Pred")
-            plt.tight_layout()
-            fig.savefig(export_dir / f"confusion_matrix_{split_name}.png", dpi=200)
-            plt.close(fig)
-        except Exception:
-            pass
+        # f1 の index は precision/recall側、thresholdsは1つ短いので -1 ずらし
+        best_idx = int(np.argmax(f1[:-1]))
+        best_thr = float(thresholds[best_idx])
+        best_f1 = float(f1[best_idx])
+        return best_thr, best_f1
 
-        # sort images by prediction (copy)
-        pred_normal_dir = export_dir / f"pred_normal_{split_name}"
-        pred_abnormal_dir = export_dir / f"pred_abnormal_{split_name}"
-        pred_normal_dir.mkdir(parents=True, exist_ok=True)
-        pred_abnormal_dir.mkdir(parents=True, exist_ok=True)
-
-        if len(img_paths) == len(y_pred):
-            for p, pred in zip(img_paths, y_pred):
-                try:
-                    src = Path(p)
-                    if not src.exists():
-                        continue
-                    dst_dir = pred_abnormal_dir if int(pred) == 1 else pred_normal_dir
-                    dst = dst_dir / src.name
-                    if dst.exists():
-                        continue
-                    shutil.copy2(src, dst)
-                except Exception:
-                    continue
-
-        LOGGER.info(f"[EXPORT] saved to: {export_dir}  (thr={float(threshold):.4f})")
-
-    # ============================
-    # Predict / Evaluate
-    # ============================
     def test(self, training_data, test_data, save_segmentation_images):
-        # NOTE: Original repository uses models.ckpt; keep as-is.
         ckpt_path = os.path.join(self.ckpt_dir, "models.ckpt")
         if os.path.exists(ckpt_path):
             state_dicts = torch.load(ckpt_path, map_location=self.device)
@@ -390,7 +325,11 @@ class SimpleNet(torch.nn.Module):
                 self.feature_dec.load_state_dict(state_dicts["pretrained_dec"])
 
         aggregator = {"scores": [], "segmentations": [], "features": []}
-        scores, segmentations, features, labels_gt, masks_gt, img_paths = self.predict(test_data)
+
+        # ★img_paths を受け取るように変更
+        scores, segmentations, features, labels_gt, masks_gt, img_paths = self.predict(
+            test_data
+        )
         aggregator["scores"].append(scores)
         aggregator["segmentations"].append(segmentations)
         aggregator["features"].append(features)
@@ -398,7 +337,7 @@ class SimpleNet(torch.nn.Module):
         scores = np.array(aggregator["scores"])
         min_scores = scores.min(axis=-1).reshape(-1, 1)
         max_scores = scores.max(axis=-1).reshape(-1, 1)
-        scores = (scores - min_scores) / (max_scores - min_scores + 1e-10)
+        scores = (scores - min_scores) / (max_scores - min_scores + 1e-12)
         scores = np.mean(scores, axis=0)
 
         segmentations = np.array(aggregator["segmentations"])
@@ -408,7 +347,7 @@ class SimpleNet(torch.nn.Module):
         max_scores = (
             segmentations.reshape(len(segmentations), -1).max(axis=-1).reshape(-1, 1, 1, 1)
         )
-        segmentations = (segmentations - min_scores) / (max_scores - min_scores + 1e-10)
+        segmentations = (segmentations - min_scores) / (max_scores - min_scores + 1e-12)
         segmentations = np.mean(segmentations, axis=0)
 
         anomaly_labels = [x[1] != "good" for x in test_data.dataset.data_to_iterate]
@@ -416,43 +355,88 @@ class SimpleNet(torch.nn.Module):
         if save_segmentation_images:
             self.save_segmentation_images(test_data, segmentations, scores)
 
-        # image-level AUROC
         auroc = metrics.compute_imagewise_retrieval_metrics(scores, anomaly_labels)["auroc"]
 
-        # pixel-level AUROC (optional)
-        full_pixel_auroc = np.nan
-        if masks_gt is not None and len(masks_gt) > 0:
-            pixel_scores = metrics.compute_pixelwise_retrieval_metrics(segmentations, masks_gt)
-            full_pixel_auroc = pixel_scores.get("auroc", np.nan)
-
-        # Export: scores CSV / confusion matrix / sorted images
-        try:
-            self._export_predictions(
-                scores_1d=np.asarray(scores),
-                labels_gt_1d=np.asarray(anomaly_labels).astype(int),
-                img_paths=img_paths,
-                split_name="test",
-                threshold=None,
-            )
-        except Exception as e:
-            LOGGER.warning(f"[EXPORT] failed in test(): {e}")
+        pixel_scores = metrics.compute_pixelwise_retrieval_metrics(segmentations, masks_gt)
+        full_pixel_auroc = pixel_scores["auroc"]
 
         return auroc, full_pixel_auroc
 
-    def _evaluate(self, test_data, scores, segmentations, features, labels_gt, masks_gt, img_paths, split_name="test"):
-        # image-level normalization
-        scores = np.squeeze(np.array(scores))
+    def _evaluate(self, test_data, scores, segmentations, features, labels_gt, masks_gt, img_paths, stem="test"):
+        """
+        ★ここで混同行列（count + %）とスコアCSV、画像振り分けコピーを行う
+        """
+        scores = np.squeeze(np.array(scores)).astype(float)
+
+        # 画像スコア正規化（元コード踏襲）
         img_min_scores = scores.min(axis=-1)
         img_max_scores = scores.max(axis=-1)
-        scores = (scores - img_min_scores) / (img_max_scores - img_min_scores + 1e-10)
+        scores = (scores - img_min_scores) / (img_max_scores - img_min_scores + 1e-12)
 
         auroc = metrics.compute_imagewise_retrieval_metrics(scores, labels_gt)["auroc"]
 
-        # default: no pixel/pro metrics (posture dataset typically has no masks)
-        full_pixel_auroc = np.nan
-        pro = np.nan
+        # -----------------------------
+        # ★閾値（F1最大）を算出 → 混同行列・分類に使う
+        # -----------------------------
+        y_true = np.array(labels_gt).astype(int)
+        thr, best_f1 = self._compute_best_threshold_f1(y_true, scores)
+        y_pred = (scores >= thr).astype(int)
 
-        if masks_gt is not None and len(masks_gt) > 0:
+        # -----------------------------
+        # ★混同行列を保存（青・normal/abnormal・count + %）
+        # 保存先：ckpt_dir/confusion_matrix/
+        # -----------------------------
+        cm_dir = os.path.join(self.ckpt_dir, "confusion_matrix")
+        save_confusion_matrices(
+            y_true=y_true,
+            y_pred=y_pred,
+            save_dir=cm_dir,
+            stem=stem,
+            labels=("normal", "abnormal"),
+            thr=thr,
+        )
+
+        # -----------------------------
+        # ★画像ごとのスコアCSV（path, y_true, score, pred, thr）
+        # 保存先：ckpt_dir/predictions/
+        # -----------------------------
+        pred_dir = os.path.join(self.ckpt_dir, "predictions")
+        os.makedirs(pred_dir, exist_ok=True)
+
+        csv_path = os.path.join(pred_dir, f"image_scores_{stem}.csv")
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("image_path,y_true,score,y_pred,threshold\n")
+            for p, t, s, pr in zip(img_paths, y_true.tolist(), scores.tolist(), y_pred.tolist()):
+                f.write(f"{p},{t},{s:.8f},{pr},{thr:.8f}\n")
+
+        # -----------------------------
+        # ★画像を判定どおりにコピー
+        # 保存先：ckpt_dir/sorted_images/{normal,abnormal}/
+        # -----------------------------
+        sorted_dir = os.path.join(self.ckpt_dir, "sorted_images")
+        out_normal = os.path.join(sorted_dir, "normal")
+        out_abnormal = os.path.join(sorted_dir, "abnormal")
+        os.makedirs(out_normal, exist_ok=True)
+        os.makedirs(out_abnormal, exist_ok=True)
+
+        for src, pr in zip(img_paths, y_pred.tolist()):
+            if not src or (not os.path.exists(src)):
+                continue
+            dst_dir = out_abnormal if pr == 1 else out_normal
+            dst = os.path.join(dst_dir, os.path.basename(src))
+            # 同名衝突を避ける
+            if os.path.exists(dst):
+                base, ext = os.path.splitext(os.path.basename(src))
+                dst = os.path.join(dst_dir, f"{base}__dup{ext}")
+            try:
+                shutil.copy2(src, dst)
+            except Exception:
+                pass
+
+        # -----------------------------
+        # pixel系（maskがある場合のみ）
+        # -----------------------------
+        if len(masks_gt) > 0:
             segmentations = np.array(segmentations)
             min_scores = (
                 segmentations.reshape(len(segmentations), -1).min(axis=-1).reshape(-1, 1, 1, 1)
@@ -460,32 +444,21 @@ class SimpleNet(torch.nn.Module):
             max_scores = (
                 segmentations.reshape(len(segmentations), -1).max(axis=-1).reshape(-1, 1, 1, 1)
             )
-
-            norm_segmentations = np.zeros_like(segmentations, dtype=np.float32)
+            norm_segmentations = np.zeros_like(segmentations)
             for min_score, max_score in zip(min_scores, max_scores):
-                denom = max(float(max_score - min_score), 1e-2)
-                norm_segmentations += (segmentations - min_score) / denom
-            norm_segmentations = norm_segmentations / max(len(scores), 1)
+                norm_segmentations += (segmentations - min_score) / max(max_score - min_score, 1e-2)
+            norm_segmentations = norm_segmentations / len(scores)
 
             pixel_scores = metrics.compute_pixelwise_retrieval_metrics(norm_segmentations, masks_gt)
-            full_pixel_auroc = pixel_scores.get("auroc", np.nan)
+            full_pixel_auroc = pixel_scores["auroc"]
 
-            try:
-                pro = metrics.compute_pro(np.squeeze(np.array(masks_gt)), norm_segmentations)
-            except Exception:
-                pro = np.nan
+            pro = metrics.compute_pro(np.squeeze(np.array(masks_gt)), norm_segmentations)
+        else:
+            full_pixel_auroc = -1
+            pro = -1
 
-        # Export requested outputs
-        try:
-            self._export_predictions(
-                scores_1d=np.asarray(scores),
-                labels_gt_1d=np.asarray(labels_gt).astype(int),
-                img_paths=img_paths,
-                split_name=split_name,
-                threshold=None,
-            )
-        except Exception as e:
-            LOGGER.warning(f"[EXPORT] failed in _evaluate(): {e}")
+        # 参考として閾値もログに出るようにする（上司説明に便利）
+        LOGGER.info(f"[{stem}] best_thr(F1)={thr:.6f} best_f1={best_f1:.4f}")
 
         return auroc, full_pixel_auroc, pro
 
@@ -502,13 +475,14 @@ class SimpleNet(torch.nn.Module):
                 self.load_state_dict(state_dict, strict=False)
 
             self.predict(training_data, "train_")
+
             scores, segmentations, features, labels_gt, masks_gt, img_paths = self.predict(test_data)
             auroc, full_pixel_auroc, anomaly_pixel_auroc = self._evaluate(
-                test_data, scores, segmentations, features, labels_gt, masks_gt, img_paths, split_name="test"
+                test_data, scores, segmentations, features, labels_gt, masks_gt, img_paths, stem="test"
             )
             return auroc, full_pixel_auroc, anomaly_pixel_auroc
 
-        def update_state_dict(_):
+        def update_state_dict(d):
             state_dict["discriminator"] = OrderedDict(
                 {k: v.detach().cpu() for k, v in self.discriminator.state_dict().items()}
             )
@@ -523,7 +497,7 @@ class SimpleNet(torch.nn.Module):
 
             scores, segmentations, features, labels_gt, masks_gt, img_paths = self.predict(test_data)
             auroc, full_pixel_auroc, pro = self._evaluate(
-                test_data, scores, segmentations, features, labels_gt, masks_gt, img_paths, split_name="test"
+                test_data, scores, segmentations, features, labels_gt, masks_gt, img_paths, stem=f"test_epoch{i_mepoch}"
             )
 
             self.logger.logger.add_scalar("i-auroc", auroc, i_mepoch)
@@ -537,21 +511,19 @@ class SimpleNet(torch.nn.Module):
                 if auroc > best_record[0]:
                     best_record = [auroc, full_pixel_auroc, pro]
                     update_state_dict(state_dict)
-                elif auroc == best_record[0] and (np.nan_to_num(full_pixel_auroc, nan=-1.0) > np.nan_to_num(best_record[1], nan=-1.0)):
+                elif auroc == best_record[0] and full_pixel_auroc > best_record[1]:
                     best_record[1] = full_pixel_auroc
                     best_record[2] = pro
                     update_state_dict(state_dict)
 
             print(
-                f"----- {i_mepoch} I-AUROC:{round(float(auroc), 4)}(MAX:{round(float(best_record[0]), 4)})"
-                f"  P-AUROC:{round(float(full_pixel_auroc) if not np.isnan(full_pixel_auroc) else float('nan'), 4)}"
-                f"(MAX:{round(float(best_record[1]) if not np.isnan(best_record[1]) else float('nan'), 4)}) -----"
-                f"  PRO:{round(float(pro) if not np.isnan(pro) else float('nan'), 4)}"
-                f"(MAX:{round(float(best_record[2]) if not np.isnan(best_record[2]) else float('nan'), 4)}) -----"
+                f"----- {i_mepoch} I-AUROC:{round(auroc, 4)}(MAX:{round(best_record[0], 4)})"
+                f"  P-AUROC{round(full_pixel_auroc, 4)}(MAX:{round(best_record[1], 4)}) -----"
+                f"  PRO-AUROC{round(pro, 4)}(MAX:{round(best_record[2], 4)}) -----"
             )
 
         torch.save(state_dict, ckpt_path)
-        return tuple(best_record)
+        return best_record
 
     def _train_discriminator(self, input_data):
         _ = self.forward_modules.eval()
@@ -560,6 +532,7 @@ class SimpleNet(torch.nn.Module):
             self.pre_projection.train()
         self.discriminator.train()
 
+        i_iter = 0
         LOGGER.info("Training discriminator...")
         with tqdm.tqdm(total=self.gan_epochs) as pbar:
             for i_epoch in range(self.gan_epochs):
@@ -574,8 +547,10 @@ class SimpleNet(torch.nn.Module):
                     if self.pre_proj > 0:
                         self.proj_opt.zero_grad()
 
+                    i_iter += 1
                     img = data_item["image"]
                     img = img.to(torch.float).to(self.device)
+
                     if self.pre_proj > 0:
                         true_feats = self.pre_projection(self._embed(img, evaluation=False)[0])
                     else:
@@ -585,7 +560,6 @@ class SimpleNet(torch.nn.Module):
                     noise_one_hot = torch.nn.functional.one_hot(
                         noise_idxs, num_classes=self.mix_noise
                     ).to(self.device)
-
                     noise = torch.stack(
                         [
                             torch.normal(0, self.noise_std * 1.1 ** (k), true_feats.shape)
@@ -603,6 +577,7 @@ class SimpleNet(torch.nn.Module):
                     th = self.dsc_margin
                     p_true = (true_scores.detach() >= th).sum() / len(true_scores)
                     p_fake = (fake_scores.detach() < -th).sum() / len(fake_scores)
+
                     true_loss = torch.clip(-true_scores + th, min=0)
                     fake_loss = torch.clip(fake_scores + th, min=0)
 
@@ -635,6 +610,7 @@ class SimpleNet(torch.nn.Module):
                 all_p_true = sum(all_p_true) / len(input_data)
                 all_p_fake = sum(all_p_fake) / len(input_data)
                 cur_lr = self.dsc_opt.state_dict()["param_groups"][0]["lr"]
+
                 pbar_str = f"epoch:{i_epoch} loss:{round(all_loss, 5)} "
                 pbar_str += f"lr:{round(cur_lr, 6)}"
                 pbar_str += f" p_true:{round(all_p_true, 3)} p_fake:{round(all_p_fake, 3)}"
@@ -646,12 +622,9 @@ class SimpleNet(torch.nn.Module):
     def predict(self, data, prefix=""):
         if isinstance(data, torch.utils.data.DataLoader):
             return self._predict_dataloader(data, prefix)
-        # if single batch tensor
-        scores, masks, feats = self._predict(data)
-        return scores, masks, feats, [], [], []
+        return self._predict(data)
 
     def _predict_dataloader(self, dataloader, prefix):
-        """This function provides anomaly scores/maps for full dataloaders."""
         _ = self.forward_modules.eval()
 
         img_paths = []
@@ -668,21 +641,22 @@ class SimpleNet(torch.nn.Module):
                     if data.get("mask", None) is not None:
                         masks_gt.extend(data["mask"].numpy().tolist())
                     image = data["image"]
-                    img_paths.extend(data.get("image_path", []))
-                else:
-                    image = data
+                    # ★画像パスを保持
+                    if data.get("image_path", None) is not None:
+                        img_paths.extend(list(data["image_path"]))
+                    else:
+                        # 無い場合は空で埋める
+                        img_paths.extend([""] * len(image))
 
                 _scores, _masks, _feats = self._predict(image)
-                for score, mask, feat in zip(_scores, _masks, _feats):
+                for score, mask in zip(_scores, _masks):
                     scores.append(score)
                     masks.append(mask)
-                    # keep features list if needed later
-                    # features.append(feat)
 
+        # ★戻り値に img_paths を追加
         return scores, masks, features, labels_gt, masks_gt, img_paths
 
     def _predict(self, images):
-        """Infer score and mask for a batch of images."""
         images = images.to(torch.float).to(self.device)
         _ = self.forward_modules.eval()
 
@@ -710,9 +684,31 @@ class SimpleNet(torch.nn.Module):
             scales = patch_shapes[0]
             patch_scores = patch_scores.reshape(batchsize, scales[0], scales[1])
             features = features.reshape(batchsize, scales[0], scales[1], -1)
-            masks, features = self.anomaly_segmentor.convert_to_segmentation(patch_scores, features)
+            masks, features = self.anomaly_segmentor.convert_to_segmentation(
+                patch_scores, features
+            )
 
         return list(image_scores), list(masks), list(features)
+
+    @staticmethod
+    def _params_file(filepath, prepend=""):
+        return os.path.join(filepath, prepend + "params.pkl")
+
+    def save_to_path(self, save_path: str, prepend: str = ""):
+        LOGGER.info("Saving data.")
+        self.anomaly_scorer.save(save_path, save_features_separately=False, prepend=prepend)
+        params = {
+            "backbone.name": self.backbone.name,
+            "layers_to_extract_from": self.layers_to_extract_from,
+            "input_shape": self.input_shape,
+            "pretrain_embed_dimension": self.forward_modules["preprocessing"].output_dim,
+            "target_embed_dimension": self.forward_modules["preadapt_aggregator"].target_dim,
+            "patchsize": self.patch_maker.patchsize,
+            "patchstride": self.patch_maker.stride,
+            "anomaly_scorer_num_nn": self.anomaly_scorer.n_nearest_neighbours,
+        }
+        with open(self._params_file(save_path, prepend), "wb") as save_file:
+            pickle.dump(params, save_file, pickle.HIGHEST_PROTOCOL)
 
     def save_segmentation_images(self, data, segmentations, scores):
         image_paths = [x[2] for x in data.dataset.data_to_iterate]
@@ -749,7 +745,10 @@ class PatchMaker:
     def patchify(self, features, return_spatial_info=False):
         padding = int((self.patchsize - 1) / 2)
         unfolder = torch.nn.Unfold(
-            kernel_size=self.patchsize, stride=self.stride, padding=padding, dilation=1
+            kernel_size=self.patchsize,
+            stride=self.stride,
+            padding=padding,
+            dilation=1,
         )
         unfolded_features = unfolder(features)
         number_of_total_patches = []
@@ -783,3 +782,4 @@ class PatchMaker:
         if was_numpy:
             return x.numpy()
         return x
+
