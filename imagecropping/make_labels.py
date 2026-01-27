@@ -1,43 +1,40 @@
 from pathlib import Path
 
-# ====== 設定 ======
-BASE_DIR = Path("dataset")
+# ====== 確定パス（あなたの環境） ======
+IMAGES_DIR = Path("/src/annotation/dataset/images/aisan/1_bottom_part_fps6_3")
+LABELS_DIR = Path("/src/annotation/dataset/labels/aisan/1_bottom_part_fps6_3")
 
-IMAGES_DIR = BASE_DIR / "images"
-LABELS_DIR = BASE_DIR / "labels"
-
-TEMPLATE_LABEL = Path("template.txt")   # 1枚だけ作った固定ボックス
+# template.txt（固定ボックスのYOLOラベルtxt）
+TEMPLATE_LABEL = Path("/src/annotation/dataset/images/aisan/1_bottom_part_490.txt")
 
 # classes.txt と同じ順・同じ名前（番号付きのままでOK）
 CLASSES = [
     "3.プレートAスレット有り",
     "4.エンドプレートE",
-    "5.金属sp A",
+    "5.金属SP A",
     "6.ガスケットB",
-    "7.金属sp B",
+    "7.金属SP B",
     "8.シートA",
     "9.シートB",
     "10.シートC",
-    "11.金属sp C",
+    "11.金属SP C",
     "12.コネクタ",
-    "13.エンドプレートC",
+    "13.エンドプレートG",
 ]
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-# ===================
+# =====================================
 
-# テンプレから座標取得
+# テンプレから座標取得（class_idは無視）
 line = TEMPLATE_LABEL.read_text(encoding="utf-8").strip()
 parts = line.split()
 if len(parts) != 5:
-    raise ValueError(f"template.txtの形式が不正です: {line}")
+    raise ValueError(f"テンプレの形式が不正です（5要素である必要）: {line}")
 
 _, x, y, w, h = parts
 
-# クラス名 -> class_id（0始まり）
 name_to_id = {name: i for i, name in enumerate(CLASSES)}
 
-# 各クラスフォルダを走査
 for class_name, class_id in name_to_id.items():
     img_dir = IMAGES_DIR / class_name
     if not img_dir.exists():
