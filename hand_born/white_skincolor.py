@@ -28,7 +28,7 @@ out = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
 
 
 # =========================
-# ① white-glove candidate (HSV)  ※少し緩め推奨：動きで絞るので
+# ① white-glove candidate (HSV)  ※少し緩め（動きで絞る）
 # =========================
 lower_white = np.array([0,   0, 140], dtype=np.uint8)
 upper_white = np.array([179, 110, 255], dtype=np.uint8)
@@ -39,43 +39,42 @@ upper_white = np.array([179, 110, 255], dtype=np.uint8)
 diff_thresh = 18          # 小さいほど動きを拾いやすい（12〜30で調整）
 use_roi = True
 
-# ROI（胸〜上半身をなるべく除外して手元中心に）
+# ROI（手元中心）
 roi_y0 = int(H * 0.30)
 roi_y1 = int(H * 0.95)
 roi_x0 = int(W * 0.05)
 roi_x1 = int(W * 0.95)
 
 # =========================
-# ③ component filter (keep "glove-like" blobs)
+# ③ component filter
 # =========================
 min_area = int(W * H * 0.0005)
 max_area = int(W * H * 0.12)
-keep_top_k = 2  # 左右手で2。分裂するなら3
+keep_top_k = 2  # 左右手。分裂するなら3
 
 # =========================
-# ④ skin-tone mapping (stronger for white gloves)
+# ④ skin-tone mapping (white glove -> stronger)
 # =========================
-target_hue = 12   # 10〜18で調整
-min_sat    = 70   # 50〜90で調整（上げるほど肌色が濃くなる）
+target_hue = 12
+min_sat    = 70
 sat_cap    = 150
-val_add    = -10  # 白っぽさを消す（-20〜+10で調整）
+val_add    = -10
 
 # =========================
 # morph kernel
 # =========================
-kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+kernel5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+kernel3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))  # 再構成用（小さめが安定）
 
 
 def keep_glove_components(mask_bin: np.ndarray) -> np.ndarray:
-    """
-    白マスクから、ROI内にある“手袋っぽい塊”だけ残す
-    """
+    """ROI内＆面積条件で“手袋っぽい塊”だけ残す"""
     num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
     if num <= 1:
         return mask_bin
 
     cand = []
-    for i in range(1, num):  # 0 is background
+    for i in range(1, num):
         x, y, w, h, area = stats[i]
         cx, cy = centroids[i]
 
@@ -89,10 +88,9 @@ def keep_glove_components(mask_bin: np.ndarray) -> np.ndarray:
         cand.append((area, i))
 
     if not cand:
-        # fallback
         return mask_bin
 
-    cand.sort(reverse=True)  # by area desc
+    cand.sort(reverse=True)
     chosen = cand[:keep_top_k]
 
     out_mask = np.zeros_like(mask_bin)
@@ -101,7 +99,22 @@ def keep_glove_components(mask_bin: np.ndarray) -> np.ndarray:
     return out_mask
 
 
-# motion detection reference
+def morphological_reconstruction(seed: np.ndarray, mask: np.ndarray, max_iters: int = 120) -> np.ndarray:
+    """
+    seed を mask の中だけで反復膨張して埋める（形態学的再構成）
+    seed, mask は 0/255 の uint8 を想定
+    """
+    prev = seed.copy()
+    for _ in range(max_iters):
+        dil = cv2.dilate(prev, kernel3, iterations=1)
+        cur = cv2.bitwise_and(dil, mask)
+        if cv2.countNonZero(cv2.absdiff(cur, prev)) == 0:
+            break
+        prev = cur
+    return prev
+
+
+# motion reference
 prev_gray = None
 
 
@@ -110,14 +123,14 @@ while True:
     if not ret:
         break
 
-    # ROI crop for processing (optional)
+    # ROI
     if use_roi:
         roi = frame[roi_y0:roi_y1, roi_x0:roi_x1]
     else:
         roi = frame
 
     # -------------------------
-    # motion mask (frame diff)
+    # motion mask
     # -------------------------
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -132,90 +145,66 @@ while True:
 
     diff = cv2.absdiff(gray, prev_gray)
     _, motion = cv2.threshold(diff, diff_thresh, 255, cv2.THRESH_BINARY)
-
-    motion = cv2.morphologyEx(motion, cv2.MORPH_OPEN,  kernel, iterations=1)
-    motion = cv2.morphologyEx(motion, cv2.MORPH_CLOSE, kernel, iterations=2)
-
+    motion = cv2.morphologyEx(motion, cv2.MORPH_OPEN,  kernel5, iterations=1)
+    motion = cv2.morphologyEx(motion, cv2.MORPH_CLOSE, kernel5, iterations=2)
     prev_gray = gray.copy()
 
     # -------------------------
-    # white candidate mask (HSV)
+    # white mask (HSV)
     # -------------------------
     hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     white = cv2.inRange(hsv_roi, lower_white, upper_white)
-    white = cv2.morphologyEx(white, cv2.MORPH_OPEN,  kernel, iterations=1)
-    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, kernel, iterations=2)
+    white = cv2.morphologyEx(white, cv2.MORPH_OPEN,  kernel5, iterations=1)
+    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, kernel5, iterations=2)
 
     # ==========================================================
-    # "moving white" seed -> select whole white components (KEY FIX)
+    # KEY: seed -> reconstruction inside white (safe fill)
     # ==========================================================
-    # 1) motion/white を少し整形
-    motion_d = cv2.dilate(motion, kernel, iterations=3)  # 動き領域を広げる
-    white_d  = cv2.morphologyEx(white, cv2.MORPH_CLOSE, kernel, iterations=2)  # 白の穴を埋める
+    # seed（動いてる白）＝輪郭になってOK
+    motion_d = cv2.dilate(motion, kernel5, iterations=2)
+    seed = cv2.bitwise_and(white, motion_d)
+    seed = cv2.dilate(seed, kernel5, iterations=1)
 
-    # 2) seed（動いてる白）を作る（輪郭でもOK：種にするだけ）
-    seed = cv2.bitwise_and(white_d, motion_d)
-    seed = cv2.dilate(seed, kernel, iterations=1)  # 種を少し太らせる（安定化）
+    # white側も軽く穴埋めしてから再構成
+    white_fill = cv2.morphologyEx(white, cv2.MORPH_CLOSE, kernel5, iterations=2)
 
-    # 3) white_d の連結成分を作って、「seedが触れてる成分」を丸ごと採用
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(white_d, connectivity=8)
-    mask_roi = np.zeros_like(white_d)
+    # 再構成：seed から white_fill の中だけ広げる
+    mask_roi = morphological_reconstruction(seed, white_fill, max_iters=140)
 
-    hit_labels = np.unique(labels[seed > 0])
-    hit_labels = hit_labels[hit_labels != 0]  # 0=背景除外
+    # 仕上げ（小穴を埋める）
+    mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_CLOSE, kernel5, iterations=3)
+    mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_OPEN,  kernel5, iterations=1)
 
-    if hit_labels.size > 0:
-        areas = []
-        for lb in hit_labels:
-            area = stats[lb, cv2.CC_STAT_AREA]
-            areas.append((area, lb))
-        areas.sort(reverse=True)
-
-        chosen = [lb for _, lb in areas[:keep_top_k]]
-        for lb in chosen:
-            mask_roi[labels == lb] = 255
-
-    # 4) 仕上げ（小穴を埋めて手袋“面”を作る）
-    mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_CLOSE, kernel, iterations=5)  # ★ 3〜8
-    mask_roi = cv2.dilate(mask_roi, kernel, iterations=1)
-    mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_OPEN,  kernel, iterations=1)
-
-    # 5) 既存の成分フィルタ（ROI/面積）もかける（推奨）
+    # “手袋っぽい塊”だけ残す
     mask_roi = keep_glove_components(mask_roi)
 
-    # debug windows
+    # debug
     cv2.imshow("motion", motion)
     cv2.imshow("white", white)
     cv2.imshow("seed", seed)
     cv2.imshow("mask", mask_roi)
 
     # -------------------------
-    # skin-tone conversion on ROI
+    # skin conversion
     # -------------------------
     m = (mask_roi > 0)
 
-    # Hue -> skin
     hsv_roi[..., 0] = np.where(m, target_hue, hsv_roi[..., 0])
 
-    # Saturation -> enforce skin-ish saturation
     s = hsv_roi[..., 1].astype(np.int16)
     s_new = np.clip(s, 0, sat_cap).astype(np.uint8)
     s_new = np.where(m, np.maximum(s_new, min_sat), hsv_roi[..., 1])
     hsv_roi[..., 1] = s_new
 
-    # Value -> adjust brightness
     v = hsv_roi[..., 2].astype(np.int16)
     v_new = np.clip(v + val_add, 0, 255).astype(np.uint8)
     hsv_roi[..., 2] = np.where(m, v_new, hsv_roi[..., 2])
 
     new_roi = cv2.cvtColor(hsv_roi, cv2.COLOR_HSV2BGR)
 
-    # paste back to full frame
     new_frame = frame.copy()
     if use_roi:
         new_frame[roi_y0:roi_y1, roi_x0:roi_x1] = new_roi
-        # ROI frame for debug (optional)
-        # cv2.rectangle(new_frame, (roi_x0, roi_y0), (roi_x1, roi_y1), (0, 255, 0), 2)
     else:
         new_frame = new_roi
 
