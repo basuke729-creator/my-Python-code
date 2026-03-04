@@ -8,36 +8,83 @@ cap = cv2.VideoCapture(input_path)
 if not cap.isOpened():
     raise RuntimeError(f"動画を開けません: {input_path}")
 
-# 動画情報
 fps = cap.get(cv2.CAP_PROP_FPS)
-if fps is None or fps <= 1e-3:   # 0になる環境があるので保険
+if fps is None or fps <= 1e-3:
     fps = 30.0
 
-width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+out = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
 
 # -----------------------
-# パラメータ（調整ポイント）
+# ① 白手袋のHSVしきい値（要調整）
 # -----------------------
-
-# 白手袋マスク（HSV）
-# 白は「Sが低い」「Vが高い」
-lower_white = np.array([0,   0, 180], dtype=np.uint8)
+lower_white = np.array([0,   0, 185], dtype=np.uint8)
 upper_white = np.array([179, 70, 255], dtype=np.uint8)
 
-# 肌色っぽいHue（OpenCVのHは0-179）
-# 15前後 = オレンジ寄り。人肌はだいたい 5〜25 くらいで調整することが多い
-target_hue = 15
+# -----------------------
+# ② 肌色寄せパラメータ（要調整）
+# -----------------------
+target_hue = 15          # 10〜20あたりで調整
+min_sat    = 35          # 肌っぽさの最低彩度
+sat_cap    = 90
+val_add    = 15          # 明るさ足す。明るすぎたら下げる/0/マイナスも可
 
-# 変換の強さ（値が小さいほど白っぽさが残る / 大きいほど肌色が濃くなる）
-sat_cap = 90      # 変換後Sの上限（肌の彩度の上限）
-sat_mult = 0.6    # 元のSに掛ける倍率（白はSほぼ0なので実質 cap が効く）
-val_add = 20      # Vに加算（明るさ調整）
+# -----------------------
+# ③ 「手袋っぽい塊」だけ残すための条件（ここが効く）
+# -----------------------
+# 手袋がありそうなROI（y開始を下げるほど“胸の作業着”を拾いにくい）
+roi_y0 = int(H * 0.35)      # 0.30〜0.45で調整（おすすめは0.35〜0.40）
+roi_y1 = int(H * 0.95)
+
+roi_x0 = int(W * 0.15)      # 中央寄りにしたいなら0.20〜0.30へ
+roi_x1 = int(W * 0.85)
+
+# 面積フィルタ（手袋サイズに合わせて調整）
+min_area = int(W * H * 0.002)   # 小さすぎる白ノイズ除外
+max_area = int(W * H * 0.08)    # 作業着の大きい白塊を除外
+
+# 残す塊の個数（左右手で2が基本。状況で3に）
+keep_top_k = 2
 
 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+def keep_glove_components(mask_bin: np.ndarray) -> np.ndarray:
+    """白マスクから、ROI内にある“手袋っぽい塊”だけ残す"""
+    # 連結成分
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
+    if num <= 1:
+        return mask_bin
+
+    candidates = []
+    for i in range(1, num):  # 0は背景
+        x, y, w, h, area = stats[i]
+        cx, cy = centroids[i]
+
+        # ROI内
+        if not (roi_x0 <= cx <= roi_x1 and roi_y0 <= cy <= roi_y1):
+            continue
+
+        # 面積条件
+        if area < min_area or area > max_area:
+            continue
+
+        candidates.append((area, i))
+
+    if not candidates:
+        # 何も残らなかったら「元マスク」を返す（真っ黒回避）
+        return mask_bin
+
+    candidates.sort(reverse=True)  # 面積が大きい順
+    chosen = candidates[:keep_top_k]
+
+    out_mask = np.zeros_like(mask_bin)
+    for _, idx in chosen:
+        out_mask[labels == idx] = 255
+
+    return out_mask
 
 while True:
     ret, frame = cap.read()
@@ -46,42 +93,34 @@ while True:
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # 1) 白領域を抽出
+    # 1) 白領域抽出
     mask = cv2.inRange(hsv, lower_white, upper_white)
 
-    # 2) ノイズ除去（白い点や小さなゴミを減らす）
+    # 2) ノイズ除去
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    # 3) 「最大の白領域」だけ残す（背景の白を巻き込みにくくする）
-    #    ※背景に大きな白がある場合は逆にそれを拾うので、その場合はこのブロックをOFFにして調整してください
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        areas = [cv2.contourArea(c) for c in contours]
-        max_i = int(np.argmax(areas))
-        new_mask = np.zeros_like(mask)
-        cv2.drawContours(new_mask, contours, max_i, 255, thickness=-1)
-        mask = new_mask
+    # 3) 手袋っぽい塊だけ残す（重要）
+    mask = keep_glove_components(mask)
 
-    # マスクを0/1に
     m = (mask > 0)
 
-    # 4) Hueを肌色に寄せる（白手袋領域だけ）
+    # 4) マスク部だけ肌色へ寄せる
     hsv[..., 0] = np.where(m, target_hue, hsv[..., 0])
 
-    # 5) 彩度Sを「肌っぽく」少し付ける（白はSが0に近いので、ここが重要）
-    #    まず元Sに倍率、上限で抑える → さらに最低でも少し彩度を持たせたい場合は下限も入れる
-    s_new = np.clip(hsv[..., 1].astype(np.float32) * sat_mult, 0, sat_cap).astype(np.uint8)
-    # 白はSがほぼ0なので、マスク領域は「最低彩度」を入れると肌っぽくなりやすい
-    min_sat = 35
+    s = hsv[..., 1].astype(np.int16)
+    s_new = np.clip(s, 0, sat_cap).astype(np.uint8)
     s_new = np.where(m, np.maximum(s_new, min_sat), hsv[..., 1])
-    hsv[..., 1] = s_new.astype(np.uint8)
+    hsv[..., 1] = s_new
 
-    # 6) 明度Vを調整（明るすぎるならval_addを下げる/マイナスにする）
-    v_new = np.clip(hsv[..., 2].astype(np.int16) + val_add, 0, 255).astype(np.uint8)
+    v = hsv[..., 2].astype(np.int16)
+    v_new = np.clip(v + val_add, 0, 255).astype(np.uint8)
     hsv[..., 2] = np.where(m, v_new, hsv[..., 2])
 
     new_frame = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+    # デバッグ表示（ROI枠を描いて確認したいなら）
+    # cv2.rectangle(new_frame, (roi_x0, roi_y0), (roi_x1, roi_y1), (0,255,0), 2)
 
     out.write(new_frame)
     cv2.imshow("frame", new_frame)
