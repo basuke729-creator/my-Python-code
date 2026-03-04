@@ -147,24 +147,46 @@ while True:
     white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     # ==========================================================
-    # "moving white" -> fill glove area (key fix)
+    # "moving white" seed -> select whole white components (KEY FIX)
     # ==========================================================
-    motion_d = cv2.dilate(motion, kernel, iterations=3)   # ★ 2〜5で調整
-    white_d  = cv2.dilate(white,  kernel, iterations=1)   # ★ 0〜2で調整
+    # 1) motion/white を少し整形
+    motion_d = cv2.dilate(motion, kernel, iterations=3)  # 動き領域を広げる
+    white_d  = cv2.morphologyEx(white, cv2.MORPH_CLOSE, kernel, iterations=2)  # 白の穴を埋める
 
-    mask_roi = cv2.bitwise_and(white_d, motion_d)
+    # 2) seed（動いてる白）を作る（輪郭でもOK：種にするだけ）
+    seed = cv2.bitwise_and(white_d, motion_d)
+    seed = cv2.dilate(seed, kernel, iterations=1)  # 種を少し太らせる（安定化）
 
-    # make it "area" not only edges
-    mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_CLOSE, kernel, iterations=4)  # ★ 2〜6
-    mask_roi = cv2.dilate(mask_roi, kernel, iterations=2)                         # ★ 1〜4
+    # 3) white_d の連結成分を作って、「seedが触れてる成分」を丸ごと採用
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(white_d, connectivity=8)
+    mask_roi = np.zeros_like(white_d)
+
+    hit_labels = np.unique(labels[seed > 0])
+    hit_labels = hit_labels[hit_labels != 0]  # 0=背景除外
+
+    if hit_labels.size > 0:
+        areas = []
+        for lb in hit_labels:
+            area = stats[lb, cv2.CC_STAT_AREA]
+            areas.append((area, lb))
+        areas.sort(reverse=True)
+
+        chosen = [lb for _, lb in areas[:keep_top_k]]
+        for lb in chosen:
+            mask_roi[labels == lb] = 255
+
+    # 4) 仕上げ（小穴を埋めて手袋“面”を作る）
+    mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_CLOSE, kernel, iterations=5)  # ★ 3〜8
+    mask_roi = cv2.dilate(mask_roi, kernel, iterations=1)
     mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_OPEN,  kernel, iterations=1)
 
-    # keep glove-like blobs only
+    # 5) 既存の成分フィルタ（ROI/面積）もかける（推奨）
     mask_roi = keep_glove_components(mask_roi)
 
     # debug windows
     cv2.imshow("motion", motion)
     cv2.imshow("white", white)
+    cv2.imshow("seed", seed)
     cv2.imshow("mask", mask_roi)
 
     # -------------------------
