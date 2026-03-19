@@ -4,8 +4,10 @@ import os
 # =========================
 # 設定
 # =========================
-input_video_path = "input.mp4"
-output_folder = "frames_png"
+input_video_path = r"C:/WorkAnalysis/movie_out3/0318_A_1.mp4"
+output_folder = r"C:/WorkAnalysis/output_png/作業者A/1"
+
+save_every_n_frames = 3   # ←ここで調整（例：3=10fps、6=5fps、30=1秒ごと）
 
 # =========================
 # フォルダ作成
@@ -22,13 +24,10 @@ if not cap.isOpened():
     exit()
 
 fps = cap.get(cv2.CAP_PROP_FPS)
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
 print(f"FPS: {fps}")
-print(f"解像度: {width}x{height}")
 
 frame_count = 0
+saved_count = 0
 
 # =========================
 # フレーム保存
@@ -38,13 +37,20 @@ while True:
     if not ret:
         break
 
-    filename = os.path.join(output_folder, f"frame_{frame_count:06d}.png")
+    # 👇 指定間隔で保存
+    if frame_count % save_every_n_frames == 0:
+        filename = os.path.join(output_folder, f"frame_{saved_count:06d}.png")
 
-    # PNG保存（圧縮レベル0〜9：3がバランス良い）
-    cv2.imwrite(filename, frame, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+        result, encoded_img = cv2.imencode(".png", frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+
+        if result:
+            encoded_img.tofile(filename)
+            saved_count += 1
 
     frame_count += 1
 
 cap.release()
 
-print(f"保存完了: {frame_count}枚")
+print("処理が完了しました")
+print(f"総フレーム数: {frame_count}")
+print(f"保存枚数: {saved_count}")
