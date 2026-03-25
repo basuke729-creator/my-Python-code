@@ -201,3 +201,140 @@ public static class AppPrefLock
         }
     }
 }
+
+import json
+import os
+import time
+import threading
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+
+# =========================
+# 設定
+# =========================
+APP_PREF_PATH = "appPref.json"
+
+
+# =========================
+# グローバル変数
+# =========================
+_app_pref_data = {}          # JSONの最新内容を保持する
+_app_pref_lock = threading.Lock()  # スレッド安全のためのロック
+_observer = None             # watchdog の Observer を保持
+
+
+# =========================
+# JSON読込処理
+# =========================
+def _load_app_pref():
+    """
+    appPref.json を読み込んで、グローバル変数に反映する内部関数
+    読み込み失敗時は何もしない
+    """
+    global _app_pref_data
+
+    try:
+        with open(APP_PREF_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # 読み込み成功したら置き換える
+        with _app_pref_lock:
+            _app_pref_data = data
+
+        print("appPref.json を再読込しました")
+
+    except Exception as e:
+        # C# 側が書き込み途中の瞬間などは失敗することがある
+        print(f"appPref.json の読込に失敗しました: {e}")
+
+
+# =========================
+# watchdog用イベントハンドラ
+# =========================
+class AppPrefEventHandler(FileSystemEventHandler):
+    """
+    appPref.json の更新を検知するためのクラス
+    """
+
+    def on_modified(self, event):
+        # フォルダ変更は無視
+        if event.is_directory:
+            return
+
+        # 変更されたファイル名だけ取り出す
+        changed_file = os.path.basename(event.src_path)
+
+        # 対象が appPref.json のときだけ再読込
+        if changed_file == os.path.basename(APP_PREF_PATH):
+            print("appPref.json の更新を検知しました")
+            _load_app_pref()
+
+    def on_created(self, event):
+        # ファイルが作り直された場合にも対応
+        if event.is_directory:
+            return
+
+        changed_file = os.path.basename(event.src_path)
+
+        if changed_file == os.path.basename(APP_PREF_PATH):
+            print("appPref.json の作成を検知しました")
+            _load_app_pref()
+
+
+# =========================
+# 監視開始関数
+# =========================
+def StartAppPrefWatch():
+    """
+    appPref.json の監視を開始する
+    最初に1回読み込んでから watchdog を開始する
+    """
+    global _observer
+
+    if _observer is not None:
+        print("すでに監視中です")
+        return
+
+    # 最初に1回読み込む
+    _load_app_pref()
+
+    # appPref.json があるフォルダを監視する
+    watch_dir = os.path.dirname(os.path.abspath(APP_PREF_PATH))
+    event_handler = AppPrefEventHandler()
+
+    observer = Observer()
+    observer.schedule(event_handler, watch_dir, recursive=False)
+    observer.start()
+
+    _observer = observer
+    print("appPref.json の監視を開始しました")
+
+
+# =========================
+# 監視停止関数
+# =========================
+def StopAppPrefWatch():
+    """
+    appPref.json の監視を停止する
+    """
+    global _observer
+
+    if _observer is not None:
+        _observer.stop()
+        _observer.join()
+        _observer = None
+        print("appPref.json の監視を停止しました")
+
+
+# =========================
+# 外から使う読出し関数
+# =========================
+def GetAppPref():
+    """
+    appPref.json の最新内容を辞書型で返す
+    引数なし
+    """
+    with _app_pref_lock:
+        return dict(_app_pref_data)
