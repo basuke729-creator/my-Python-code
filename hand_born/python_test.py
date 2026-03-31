@@ -8,10 +8,12 @@ from watchdog.events import FileSystemEventHandler
 
 APP_PREF_PATH = r"C:\temp\AppPrefs.json"
 _app_pref_fp = None
+_app_pref_lock_size = 0
 
 
 def LockAppPref() -> bool:
     global _app_pref_fp
+    global _app_pref_lock_size
 
     try:
         if _app_pref_fp is not None:
@@ -22,8 +24,19 @@ def LockAppPref() -> bool:
                 json.dump({}, f, ensure_ascii=False, indent=4)
 
         _app_pref_fp = open(APP_PREF_PATH, "r+", encoding="utf-8")
+
+        # ファイルサイズ取得
+        _app_pref_fp.seek(0, os.SEEK_END)
+        _app_pref_lock_size = _app_pref_fp.tell()
+
+        # 空ファイルだと0になるので、最低1バイトはロックする
+        if _app_pref_lock_size <= 0:
+            _app_pref_lock_size = 1
+
+        # 先頭に戻してファイル全体をロック
         _app_pref_fp.seek(0)
-        msvcrt.locking(_app_pref_fp.fileno(), msvcrt.LK_NBLCK, 1)
+        msvcrt.locking(_app_pref_fp.fileno(), msvcrt.LK_NBLCK, _app_pref_lock_size)
+
         return True
 
     except Exception as e:
@@ -34,21 +47,29 @@ def LockAppPref() -> bool:
             except:
                 pass
             _app_pref_fp = None
+        _app_pref_lock_size = 0
         return False
 
 
 def UnlockAppPref() -> None:
     global _app_pref_fp
+    global _app_pref_lock_size
 
     try:
         if _app_pref_fp is not None:
             _app_pref_fp.seek(0)
-            msvcrt.locking(_app_pref_fp.fileno(), msvcrt.LK_UNLCK, 1)
+
+            unlock_size = _app_pref_lock_size
+            if unlock_size <= 0:
+                unlock_size = 1
+
+            msvcrt.locking(_app_pref_fp.fileno(), msvcrt.LK_UNLCK, unlock_size)
             _app_pref_fp.close()
     except Exception as e:
         print("UnlockAppPref error:", e)
     finally:
         _app_pref_fp = None
+        _app_pref_lock_size = 0
 
 
 def GetAppPref(data_name: str):
