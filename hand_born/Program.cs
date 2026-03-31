@@ -3,18 +3,24 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 public class CameraInfo
 {
-    public string AppPrefPath { get; set; }
+    public string AppPrefPath { get; set; } = "";
 }
 
 public class AppPreferenceManager
 {
-    private FileStream _lockStream = null;
-    private string _currentPath = null;
+    private FileStream? _lockStream = null;
+    private string? _currentPath = null;
 
-    protected bool LockApplicationPreference()
+    // ============================================
+    // アクセス禁止関数
+    // ファイルロック成功: true
+    // ファイルロック失敗: false
+    // ============================================
+    public bool LockApplicationPreference()
     {
         try
         {
@@ -53,6 +59,7 @@ public class AppPreferenceManager
                 catch
                 {
                 }
+
                 _lockStream = null;
             }
 
@@ -60,7 +67,10 @@ public class AppPreferenceManager
         }
     }
 
-    protected void UnlockApplicationPreference()
+    // ============================================
+    // アクセス許可関数
+    // ============================================
+    public void UnlockApplicationPreference()
     {
         try
         {
@@ -78,7 +88,10 @@ public class AppPreferenceManager
         }
     }
 
-    protected bool SetApplicationPreference(CameraInfo cameraInfo, string dataName, string type, string value)
+    // ============================================
+    // json更新用関数
+    // ============================================
+    public bool SetApplicationPreference(CameraInfo cameraInfo, string dataName, string type, string value)
     {
         try
         {
@@ -100,9 +113,9 @@ public class AppPreferenceManager
             }
 
             string jsonText;
-            using (var reader = new StreamReader(_lockStream, Encoding.UTF8, true, 1024, true))
+            using (var reader = new StreamReader(_lockStream!, Encoding.UTF8, true, 1024, true))
             {
-                _lockStream.Seek(0, SeekOrigin.Begin);
+                _lockStream!.Seek(0, SeekOrigin.Begin);
                 jsonText = reader.ReadToEnd();
             }
 
@@ -142,7 +155,7 @@ public class AppPreferenceManager
                 WriteIndented = true
             });
 
-            _lockStream.SetLength(0);
+            _lockStream!.SetLength(0);
             _lockStream.Seek(0, SeekOrigin.Begin);
 
             using (var writer = new StreamWriter(_lockStream, new UTF8Encoding(false), 1024, true))
@@ -165,7 +178,12 @@ public class AppPreferenceManager
         }
     }
 
-    protected string GetApplicationPreference(CameraInfo cameraInfo, string dataName, string type)
+    // ============================================
+    // json読出し用関数
+    // 成功時: Value を返す
+    // 失敗時: null を返す
+    // ============================================
+    public string? GetApplicationPreference(CameraInfo cameraInfo, string dataName, string type)
     {
         try
         {
@@ -187,9 +205,9 @@ public class AppPreferenceManager
             }
 
             string jsonText;
-            using (var reader = new StreamReader(_lockStream, Encoding.UTF8, true, 1024, true))
+            using (var reader = new StreamReader(_lockStream!, Encoding.UTF8, true, 1024, true))
             {
-                _lockStream.Seek(0, SeekOrigin.Begin);
+                _lockStream!.Seek(0, SeekOrigin.Begin);
                 jsonText = reader.ReadToEnd();
             }
 
@@ -218,7 +236,7 @@ public class AppPreferenceManager
 
             if (item.ContainsKey("PrefType"))
             {
-                string prefType = item["PrefType"]?.ToString();
+                string prefType = item["PrefType"]?.ToString() ?? "";
                 if (!string.Equals(prefType, type, StringComparison.Ordinal))
                 {
                     return null;
@@ -242,7 +260,10 @@ public class AppPreferenceManager
         }
     }
 
-    // テスト用に protected を呼び出すためのラッパー
+    // ============================================
+    // テスト用
+    // 外からロックだけ試したいとき用
+    // ============================================
     public bool TestLock(CameraInfo cameraInfo)
     {
         _currentPath = cameraInfo.AppPrefPath;
@@ -253,16 +274,6 @@ public class AppPreferenceManager
     {
         UnlockApplicationPreference();
     }
-
-    public bool TestSet(CameraInfo cameraInfo, string dataName, string type, string value)
-    {
-        return SetApplicationPreference(cameraInfo, dataName, type, value);
-    }
-
-    public string TestGet(CameraInfo cameraInfo, string dataName, string type)
-    {
-        return GetApplicationPreference(cameraInfo, dataName, type);
-    }
 }
 
 class Program
@@ -271,7 +282,8 @@ class Program
     {
         var cameraInfo = new CameraInfo
         {
-            AppPrefPath = @"C:\temp\AppPrefs.json"
+            // Python側と合わせる
+            AppPrefPath = @"C:\test_0319\AppPrefs.json"
         };
 
         var manager = new AppPreferenceManager();
@@ -279,10 +291,10 @@ class Program
         Console.WriteLine("=== C# Test Menu ===");
         Console.WriteLine("1: ロックして10秒保持");
         Console.WriteLine("2: ロックできるか試すだけ");
-        Console.WriteLine("3: Mode=3, Ready=0 に書き込む");
+        Console.WriteLine("3: Mode=5, Ready=1 に書き込む");
         Console.WriteLine("4: Mode, Ready を読む");
         Console.Write("番号を入力してください: ");
-        string choice = Console.ReadLine();
+        string? choice = Console.ReadLine();
 
         if (choice == "1")
         {
@@ -295,7 +307,7 @@ class Program
                 try
                 {
                     Console.WriteLine("C#: 10秒ロック保持します。今のうちにPythonでロックを試してください。");
-                    System.Threading.Thread.Sleep(10000);
+                    Thread.Sleep(10000);
                 }
                 finally
                 {
@@ -318,16 +330,16 @@ class Program
         }
         else if (choice == "3")
         {
-            bool ok1 = manager.TestSet(cameraInfo, "Mode", "Integer", "5");
+            bool ok1 = manager.SetApplicationPreference(cameraInfo, "Mode", "Integer", "5");
             Console.WriteLine("C#: Set Mode result = " + ok1);
 
-            bool ok2 = manager.TestSet(cameraInfo, "Ready", "String", "1");
+            bool ok2 = manager.SetApplicationPreference(cameraInfo, "Ready", "String", "1");
             Console.WriteLine("C#: Set Ready result = " + ok2);
         }
         else if (choice == "4")
         {
-            string mode = manager.TestGet(cameraInfo, "Mode", "Integer");
-            string ready = manager.TestGet(cameraInfo, "Ready", "String");
+            string? mode = manager.GetApplicationPreference(cameraInfo, "Mode", "Integer");
+            string? ready = manager.GetApplicationPreference(cameraInfo, "Ready", "String");
 
             Console.WriteLine("C#: Mode = " + mode);
             Console.WriteLine("C#: Ready = " + ready);
