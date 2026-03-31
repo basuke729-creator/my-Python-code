@@ -6,11 +6,20 @@ import msvcrt
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-APP_PREF_PATH = r"C:\temp\AppPrefs.json"
+
+# =========================================================
+# 本番JSONパス
+# C#側と必ず同じにしてください
+# =========================================================
+APP_PREF_PATH = r"C:\i-pro\27_PC版対応\00_調査\jsonsample\AppPrefs.json"
+
 _app_pref_fp = None
 _app_pref_lock_size = 0
 
 
+# =========================================================
+# アクセス禁止関数
+# =========================================================
 def LockAppPref() -> bool:
     global _app_pref_fp
     global _app_pref_lock_size
@@ -20,20 +29,17 @@ def LockAppPref() -> bool:
             return False
 
         if not os.path.exists(APP_PREF_PATH):
-            with open(APP_PREF_PATH, "w", encoding="utf-8") as f:
-                json.dump({}, f, ensure_ascii=False, indent=4)
+            print("LockAppPref: JSONファイルが存在しません")
+            return False
 
         _app_pref_fp = open(APP_PREF_PATH, "r+", encoding="utf-8")
 
-        # ファイルサイズ取得
         _app_pref_fp.seek(0, os.SEEK_END)
         _app_pref_lock_size = _app_pref_fp.tell()
 
-        # 空ファイルだと0になるので、最低1バイトはロックする
         if _app_pref_lock_size <= 0:
             _app_pref_lock_size = 1
 
-        # 先頭に戻してファイル全体をロック
         _app_pref_fp.seek(0)
         msvcrt.locking(_app_pref_fp.fileno(), msvcrt.LK_NBLCK, _app_pref_lock_size)
 
@@ -41,16 +47,21 @@ def LockAppPref() -> bool:
 
     except Exception as e:
         print("LockAppPref error:", e)
+
         if _app_pref_fp is not None:
             try:
                 _app_pref_fp.close()
             except:
                 pass
-            _app_pref_fp = None
+
+        _app_pref_fp = None
         _app_pref_lock_size = 0
         return False
 
 
+# =========================================================
+# アクセス許可関数
+# =========================================================
 def UnlockAppPref() -> None:
     global _app_pref_fp
     global _app_pref_lock_size
@@ -72,70 +83,27 @@ def UnlockAppPref() -> None:
         _app_pref_lock_size = 0
 
 
-def GetAppPref(data_name: str):
-    global _app_pref_fp
-
-    if _app_pref_fp is None:
-        return None
-
-    try:
-        _app_pref_fp.seek(0)
-        text = _app_pref_fp.read()
-
-        if text.strip() == "":
-            return None
-
-        data = json.loads(text)
-
-        if data_name not in data:
-            return None
-
-        if isinstance(data[data_name], dict) and "Value" in data[data_name]:
-            return data[data_name]["Value"]
-
-        return None
-
-    except Exception as e:
-        print("GetAppPref error:", e)
-        return None
-
-
+# =========================================================
+# json更新用関数
+# update_pref の key に対応する項目の Value を更新
+# =========================================================
 def SetAppPref(update_pref: dict) -> bool:
-    global _app_pref_fp
-
     if not isinstance(update_pref, dict):
         return False
 
-    if _app_pref_fp is None:
+    if not LockAppPref():
         return False
 
     try:
-        _app_pref_fp.seek(0)
-        text = _app_pref_fp.read()
-
-        if text.strip() == "":
-            data = {}
-        else:
-            data = json.loads(text)
+        with open(APP_PREF_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
         for key, value in update_pref.items():
-            value_str = str(value)
-
             if key in data and isinstance(data[key], dict):
-                data[key]["Value"] = value_str
-            else:
-                data[key] = {
-                    "PrefType": "String",
-                    "CameraAccess": "ReadWrite",
-                    "ScreenAccess": "ReadWrite",
-                    "Value": value_str
-                }
+                data[key]["Value"] = str(value)
 
-        _app_pref_fp.seek(0)
-        _app_pref_fp.truncate()
-        json.dump(data, _app_pref_fp, ensure_ascii=False, indent=4)
-        _app_pref_fp.flush()
-        os.fsync(_app_pref_fp.fileno())
+        with open(APP_PREF_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
 
         return True
 
@@ -143,49 +111,102 @@ def SetAppPref(update_pref: dict) -> bool:
         print("SetAppPref error:", e)
         return False
 
+    finally:
+        UnlockAppPref()
 
-def WaitAppPrefUpdated(timeout_sec=None) -> bool:
-    watch_dir = os.path.dirname(APP_PREF_PATH)
-    if watch_dir == "":
-        watch_dir = "."
 
-    updated = {"done": False}
+# =========================================================
+# watchdog用
+# =========================================================
+class _JsonUpdateHandler(FileSystemEventHandler):
+    def __init__(self):
+        self.updated = False
 
-    class JsonChangeHandler(FileSystemEventHandler):
-        def on_modified(self, event):
-            if event.is_directory:
-                return
-
+    def on_modified(self, event):
+        try:
             event_path = os.path.abspath(event.src_path)
             target_path = os.path.abspath(APP_PREF_PATH)
 
             if event_path == target_path:
-                updated["done"] = True
+                self.updated = True
+        except:
+            pass
 
+
+# =========================================================
+# json読出し用関数
+# 要件：
+# - 引数なし
+# - C#からjsonが更新されたことを検知して読出し
+# - 全パラメータの値を辞書型で返す
+# =========================================================
+def GetAppPref() -> dict:
+    watch_dir = os.path.dirname(APP_PREF_PATH)
+    if watch_dir == "":
+        watch_dir = "."
+
+    handler = _JsonUpdateHandler()
     observer = Observer()
-    handler = JsonChangeHandler()
-    observer.schedule(handler, watch_dir, recursive=False)
+    observer.schedule(handler, path=watch_dir, recursive=False)
     observer.start()
 
-    start_time = time.time()
-
     try:
-        while not updated["done"]:
+        start_time = time.time()
+        timeout_sec = 30
+
+        while True:
+            if handler.updated:
+                break
+
+            if time.time() - start_time > timeout_sec:
+                print("GetAppPref: 更新待ちタイムアウト")
+                return {}
+
             time.sleep(0.1)
-
-            if timeout_sec is not None:
-                if (time.time() - start_time) >= timeout_sec:
-                    return False
-
-        time.sleep(0.1)
-        return True
 
     finally:
         observer.stop()
         observer.join()
 
+    if not LockAppPref():
+        print("GetAppPref: Lock失敗")
+        return {}
 
-def test_lock_hold():
+    try:
+        with open(APP_PREF_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        result = {}
+        for key, value in data.items():
+            if isinstance(value, dict):
+                result[key] = value.get("Value", None)
+            else:
+                result[key] = None
+
+        return result
+
+    except Exception as e:
+        print("GetAppPref error:", e)
+        return {}
+
+    finally:
+        UnlockAppPref()
+
+
+# =========================================================
+# テスト用関数
+# 本番JSONでは比較的安全なキーを使う
+# =========================================================
+def test_python_write_production_json():
+    print("Python: ModelName, WorkProcedureName を更新します")
+    ok = SetAppPref({
+        "ModelName": "PYTHON_TEST_MODEL",
+        "WorkProcedureName": "PYTHON_TEST_WORK"
+    })
+    print("Python: SetAppPref result =", ok)
+
+
+def test_python_lock_hold():
     print("Python: LockAppPref 開始")
     ok = LockAppPref()
     print("Python: Lock result =", ok)
@@ -199,7 +220,7 @@ def test_lock_hold():
             print("Python: Unlock 完了")
 
 
-def test_try_lock_only():
+def test_python_try_lock_only():
     print("Python: LockAppPref 試行")
     ok = LockAppPref()
     print("Python: Lock result =", ok)
@@ -209,68 +230,55 @@ def test_try_lock_only():
         print("Python: すぐUnlockしました")
 
 
-def test_write_mode():
-    if LockAppPref():
-        try:
-            ok = SetAppPref({"Mode": "2", "Ready": "1"})
-            print("Python: SetAppPref result =", ok)
-        finally:
-            UnlockAppPref()
-    else:
-        print("Python: ロック失敗")
-
-
-def test_read_mode():
-    if LockAppPref():
-        try:
-            mode = GetAppPref("Mode")
-            ready = GetAppPref("Ready")
-            print("Python: Mode =", mode)
-            print("Python: Ready =", ready)
-        finally:
-            UnlockAppPref()
-    else:
-        print("Python: ロック失敗")
-
-
-def test_wait_and_read():
+def test_wait_csharp_update_and_read():
     print("Python: C#からの更新待ちを開始します")
-    updated = WaitAppPrefUpdated(30)
-    print("Python: Wait result =", updated)
+    prefs = GetAppPref()
 
-    if updated:
-        if LockAppPref():
-            try:
-                mode = GetAppPref("Mode")
-                ready = GetAppPref("Ready")
-                print("Python: updated Mode =", mode)
-                print("Python: updated Ready =", ready)
-            finally:
-                UnlockAppPref()
-        else:
-            print("Python: 更新後ロック失敗")
+    if prefs:
+        print("Python: Wait and Read result")
+        print("ModelName =", prefs.get("ModelName"))
+        print("WorkProcedureName =", prefs.get("WorkProcedureName"))
     else:
-        print("Python: タイムアウトしました")
+        print("Python: 読み取り失敗またはタイムアウト")
+
+
+def test_read_current_json_direct():
+    print("Python: 現在のJSONを直接読みます")
+
+    if not LockAppPref():
+        print("Python: Lock失敗")
+        return
+
+    try:
+        with open(APP_PREF_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        print("ModelName =", data.get("ModelName", {}).get("Value"))
+        print("WorkProcedureName =", data.get("WorkProcedureName", {}).get("Value"))
+    except Exception as e:
+        print("Python: direct read error:", e)
+    finally:
+        UnlockAppPref()
 
 
 if __name__ == "__main__":
-    print("=== Python Test Menu ===")
-    print("1: ロックして10秒保持")
-    print("2: ロックできるか試すだけ")
-    print("3: Mode=2, Ready=1 に書き込む")
-    print("4: Mode, Ready を読む")
-    print("5: C#更新待ちして読込む")
+    print("=== Python Production JSON Test Menu ===")
+    print("1: Python から ModelName, WorkProcedureName を更新")
+    print("2: Python でロックして10秒保持")
+    print("3: ロックできるか試すだけ")
+    print("4: C#更新待ちして全件読込む")
+    print("5: 今のJSONから ModelName, WorkProcedureName を直接表示")
     choice = input("番号を入力してください: ").strip()
 
     if choice == "1":
-        test_lock_hold()
+        test_python_write_production_json()
     elif choice == "2":
-        test_try_lock_only()
+        test_python_lock_hold()
     elif choice == "3":
-        test_write_mode()
+        test_python_try_lock_only()
     elif choice == "4":
-        test_read_mode()
+        test_wait_csharp_update_and_read()
     elif choice == "5":
-        test_wait_and_read()
+        test_read_current_json_direct()
     else:
         print("不正な入力です")

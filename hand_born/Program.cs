@@ -17,8 +17,6 @@ public class AppPreferenceManager
 
     // ============================================
     // アクセス禁止関数
-    // ファイルロック成功: true
-    // ファイルロック失敗: false
     // ============================================
     public bool LockApplicationPreference()
     {
@@ -36,7 +34,7 @@ public class AppPreferenceManager
 
             if (!File.Exists(_currentPath))
             {
-                File.WriteAllText(_currentPath, "{}", new UTF8Encoding(false));
+                return false;
             }
 
             _lockStream = new FileStream(
@@ -121,33 +119,22 @@ public class AppPreferenceManager
 
             if (string.IsNullOrWhiteSpace(jsonText))
             {
-                jsonText = "{}";
+                return false;
             }
 
             var jsonData = JsonSerializer.Deserialize<Dictionary<string, Dictionary<string, object>>>(jsonText);
 
             if (jsonData == null)
             {
-                jsonData = new Dictionary<string, Dictionary<string, object>>();
+                return false;
             }
 
             if (!jsonData.ContainsKey(dataName) || jsonData[dataName] == null)
             {
-                jsonData[dataName] = new Dictionary<string, object>();
+                return false;
             }
 
             jsonData[dataName]["PrefType"] = type;
-
-            if (!jsonData[dataName].ContainsKey("CameraAccess"))
-            {
-                jsonData[dataName]["CameraAccess"] = "ReadWrite";
-            }
-
-            if (!jsonData[dataName].ContainsKey("ScreenAccess"))
-            {
-                jsonData[dataName]["ScreenAccess"] = "ReadWrite";
-            }
-
             jsonData[dataName]["Value"] = value;
 
             string outputJson = JsonSerializer.Serialize(jsonData, new JsonSerializerOptions
@@ -180,8 +167,6 @@ public class AppPreferenceManager
 
     // ============================================
     // json読出し用関数
-    // 成功時: Value を返す
-    // 失敗時: null を返す
     // ============================================
     public string? GetApplicationPreference(CameraInfo cameraInfo, string dataName, string type)
     {
@@ -262,7 +247,6 @@ public class AppPreferenceManager
 
     // ============================================
     // テスト用
-    // 外からロックだけ試したいとき用
     // ============================================
     public bool TestLock(CameraInfo cameraInfo)
     {
@@ -282,17 +266,16 @@ class Program
     {
         var cameraInfo = new CameraInfo
         {
-            // Python側と合わせる
-            AppPrefPath = @"C:\test_0319\AppPrefs.json"
+            AppPrefPath = @"C:\i-pro\27_PC版対応\00_調査\jsonsample\AppPrefs.json"
         };
 
         var manager = new AppPreferenceManager();
 
-        Console.WriteLine("=== C# Test Menu ===");
+        Console.WriteLine("=== C# Production JSON Test Menu ===");
         Console.WriteLine("1: ロックして10秒保持");
         Console.WriteLine("2: ロックできるか試すだけ");
-        Console.WriteLine("3: Mode=5, Ready=1 に書き込む");
-        Console.WriteLine("4: Mode, Ready を読む");
+        Console.WriteLine("3: ModelName, WorkProcedureName を更新");
+        Console.WriteLine("4: ModelName, WorkProcedureName を読む");
         Console.Write("番号を入力してください: ");
         string? choice = Console.ReadLine();
 
@@ -330,19 +313,19 @@ class Program
         }
         else if (choice == "3")
         {
-            bool ok1 = manager.SetApplicationPreference(cameraInfo, "Mode", "Integer", "5");
-            Console.WriteLine("C#: Set Mode result = " + ok1);
+            bool ok1 = manager.SetApplicationPreference(cameraInfo, "ModelName", "String", "CSHARP_TEST_MODEL");
+            Console.WriteLine("C#: Set ModelName result = " + ok1);
 
-            bool ok2 = manager.SetApplicationPreference(cameraInfo, "Ready", "String", "1");
-            Console.WriteLine("C#: Set Ready result = " + ok2);
+            bool ok2 = manager.SetApplicationPreference(cameraInfo, "WorkProcedureName", "String", "CSHARP_TEST_WORK");
+            Console.WriteLine("C#: Set WorkProcedureName result = " + ok2);
         }
         else if (choice == "4")
         {
-            string? mode = manager.GetApplicationPreference(cameraInfo, "Mode", "Integer");
-            string? ready = manager.GetApplicationPreference(cameraInfo, "Ready", "String");
+            string? model = manager.GetApplicationPreference(cameraInfo, "ModelName", "String");
+            string? work = manager.GetApplicationPreference(cameraInfo, "WorkProcedureName", "String");
 
-            Console.WriteLine("C#: Mode = " + mode);
-            Console.WriteLine("C#: Ready = " + ready);
+            Console.WriteLine("C#: ModelName = " + model);
+            Console.WriteLine("C#: WorkProcedureName = " + work);
         }
         else
         {

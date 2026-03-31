@@ -1,0 +1,181 @@
+テスト1
+Python から本番JSONを更新できることの確認
+
+目的
+Python の SetAppPref(update_pref) で本番JSONを更新できること
+
+実施方法
+本番JSONを開いて、初期値を確認する
+特に次の2項目を見る
+ModelName
+WorkProcedureName
+Pythonコードを起動する
+メニューで 1 を入力する
+1: Python から ModelName, WorkProcedureName を更新
+実行後に、本番JSONを直接開いて内容を確認する
+期待結果
+ModelName の Value が PYTHON_TEST_MODEL
+WorkProcedureName の Value が PYTHON_TEST_WORK
+
+
+テスト2
+名称
+
+C# から本番JSONを更新できることの確認
+
+目的
+
+以下を確認する。
+
+C# の SetApplicationPreference で本番JSONを更新できること
+実施方法
+C# 側を起動する
+dotnet run
+メニューで 3 を入力する
+3: ModelName, WorkProcedureName を更新
+実行後に、本番JSONを直接開いて内容を確認する
+期待結果
+ModelName の Value が CSHARP_TEST_MODEL
+WorkProcedureName の Value が CSHARP_TEST_WORK
+確認できること
+C# 側の SetApplicationPreference が本番JSONで動作する
+テスト3
+名称
+
+Pythonロック中にC#がアクセスできないことの確認
+
+目的
+
+以下を確認する。
+
+LockAppPref / UnlockAppPref
+LockApplicationPreference / UnlockApplicationPreference
+更新中や読み込み中に他方から変更できないこと
+実施方法
+Python側を起動する
+python app_pref_python_prod.py
+メニューで 2 を入力する
+2: Python でロックして10秒保持
+その10秒の間に、C#側を起動する
+dotnet run
+C#メニューで 2 を入力する
+2: ロックできるか試すだけ
+期待結果
+
+C#側で
+
+C#: Lock result = False
+確認できること
+Pythonロック中はC#がファイルに入れない
+排他制御が成立している
+テスト4
+名称
+
+C#ロック中にPythonがアクセスできないことの確認
+
+目的
+
+以下を確認する。
+
+双方向で排他制御が成立していること
+実施方法
+C#側を起動する
+dotnet run
+メニューで 1 を入力する
+1: ロックして10秒保持
+その10秒の間に、Python側を起動する
+python app_pref_python_prod.py
+Pythonメニューで 3 を入力する
+3: ロックできるか試すだけ
+期待結果
+
+Python側で
+
+Python: Lock result = False
+確認できること
+C#ロック中はPythonがファイルに入れない
+双方向のロックが有効
+テスト5
+名称
+
+Python更新内容をC#が読めることの確認
+
+目的
+
+以下を確認する。
+
+Python → 本番JSON → C# の連携が成立していること
+C# の GetApplicationPreference が本番JSONで読めること
+実施方法
+Python側を起動する
+python app_pref_python_prod.py
+メニューで 1 を入力して更新する
+更新後、C#側を起動する
+dotnet run
+C#メニューで 4 を入力する
+4: ModelName, WorkProcedureName を読む
+期待結果
+
+C#側で
+
+C#: ModelName = PYTHON_TEST_MODEL
+C#: WorkProcedureName = PYTHON_TEST_WORK
+確認できること
+Pythonで更新した本番JSONをC#で正しく読める
+テスト6
+名称
+
+C#更新内容をPythonが読めることの確認
+
+目的
+
+以下を確認する。
+
+C# → 本番JSON → Python の連携が成立していること
+実施方法
+C#側を起動する
+dotnet run
+メニューで 3 を入力して更新する
+更新後、Python側を起動する
+python app_pref_python_prod.py
+Pythonメニューで 5 を入力する
+5: 今のJSONから ModelName, WorkProcedureName を直接表示
+期待結果
+
+Python側で
+
+ModelName = CSHARP_TEST_MODEL
+WorkProcedureName = CSHARP_TEST_WORK
+確認できること
+C#で更新した本番JSONをPythonで正しく読める
+テスト7
+名称
+
+C#更新をPythonが検知して読めることの確認
+
+目的
+
+以下を確認する。
+
+GetAppPref() が watchdog を使って C# の更新を検知できること
+GetAppPref() が全件辞書で返せること
+実施方法
+Python側を起動する
+python app_pref_python_prod.py
+メニューで 4 を入力する
+4: C#更新待ちして全件読込む
+Python は待機状態になる
+その状態のまま、C#側を起動する
+dotnet run
+C#メニューで 3 を入力する
+ModelName, WorkProcedureName を更新
+期待結果
+
+Python側で
+
+Python: Wait and Read result
+ModelName = CSHARP_TEST_MODEL
+WorkProcedureName = CSHARP_TEST_WORK
+確認できること
+C#の更新をPythonが検知できる
+Pythonの GetAppPref() が仕様どおりに動いている
