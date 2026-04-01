@@ -85,8 +85,16 @@ def UnlockAppPref() -> None:
 
 # =========================================================
 # json更新用関数
+# 仕様:
+# - update_pref は辞書型
+# - 全読出し
+# - 一部更新
+# - 全書込み
+# - ロック付き
 # =========================================================
 def SetAppPref(update_pref: dict) -> bool:
+    global _app_pref_fp
+
     if not isinstance(update_pref, dict):
         return False
 
@@ -94,15 +102,26 @@ def SetAppPref(update_pref: dict) -> bool:
         return False
 
     try:
-        with open(APP_PREF_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        # ロック済みの同じファイルポインタで読む
+        _app_pref_fp.seek(0)
+        text = _app_pref_fp.read()
 
+        if text.strip() == "":
+            data = {}
+        else:
+            data = json.loads(text)
+
+        # 一部更新
         for key, value in update_pref.items():
             if key in data and isinstance(data[key], dict):
                 data[key]["Value"] = str(value)
 
-        with open(APP_PREF_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        # 全書込み
+        _app_pref_fp.seek(0)
+        _app_pref_fp.truncate()
+        json.dump(data, _app_pref_fp, ensure_ascii=False, indent=4)
+        _app_pref_fp.flush()
+        os.fsync(_app_pref_fp.fileno())
 
         return True
 
@@ -134,7 +153,7 @@ class _JsonUpdateHandler(FileSystemEventHandler):
 
 # =========================================================
 # json読出し用関数
-# 要件：
+# 仕様:
 # - 引数なし
 # - C#からjsonが更新されたことを検知して読出し
 # - 全パラメータの値を辞書型で返す
@@ -172,8 +191,14 @@ def GetAppPref() -> dict:
         return {}
 
     try:
-        with open(APP_PREF_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        # ロック済みの同じファイルポインタで読む
+        _app_pref_fp.seek(0)
+        text = _app_pref_fp.read()
+
+        if text.strip() == "":
+            return {}
+
+        data = json.loads(text)
 
         result = {}
         for key, value in data.items():
@@ -196,18 +221,28 @@ def GetAppPref() -> dict:
 # 補助: 現在値を直接読む
 # =========================================================
 def direct_read_mode_and_camera_status():
+    global _app_pref_fp
+
     if not LockAppPref():
         print("Python: Lock失敗")
         return
 
     try:
-        with open(APP_PREF_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        _app_pref_fp.seek(0)
+        text = _app_pref_fp.read()
+
+        if text.strip() == "":
+            print("Python: JSONが空です")
+            return
+
+        data = json.loads(text)
 
         print("Mode =", data.get("Mode", {}).get("Value"))
         print("CameraStatus =", data.get("CameraStatus", {}).get("Value"))
+
     except Exception as e:
         print("Python: direct read error:", e)
+
     finally:
         UnlockAppPref()
 
