@@ -15,9 +15,6 @@ public class AppPreferenceManager
     private FileStream? _lockStream = null;
     private string? _currentPath = null;
 
-    // ============================================
-    // アクセス禁止関数
-    // ============================================
     public bool LockApplicationPreference()
     {
         try
@@ -65,9 +62,6 @@ public class AppPreferenceManager
         }
     }
 
-    // ============================================
-    // アクセス許可関数
-    // ============================================
     public void UnlockApplicationPreference()
     {
         try
@@ -86,9 +80,6 @@ public class AppPreferenceManager
         }
     }
 
-    // ============================================
-    // json更新用関数
-    // ============================================
     public bool SetApplicationPreference(CameraInfo cameraInfo, string dataName, string type, string value)
     {
         try
@@ -165,9 +156,6 @@ public class AppPreferenceManager
         }
     }
 
-    // ============================================
-    // json読出し用関数
-    // ============================================
     public string? GetApplicationPreference(CameraInfo cameraInfo, string dataName, string type)
     {
         try
@@ -245,9 +233,6 @@ public class AppPreferenceManager
         }
     }
 
-    // ============================================
-    // テスト用
-    // ============================================
     public bool TestLock(CameraInfo cameraInfo)
     {
         _currentPath = cameraInfo.AppPrefPath;
@@ -274,8 +259,9 @@ class Program
         Console.WriteLine("=== C# Production JSON Test Menu ===");
         Console.WriteLine("1: ロックして10秒保持");
         Console.WriteLine("2: ロックできるか試すだけ");
-        Console.WriteLine("3: ModelName, WorkProcedureName を更新");
-        Console.WriteLine("4: ModelName, WorkProcedureName を読む");
+        Console.WriteLine("3: Mode=2, CameraStatus=0 に更新");
+        Console.WriteLine("4: Mode, CameraStatus を読む");
+        Console.WriteLine("5: Mode=1, CameraStatus=1 に戻す");
         Console.Write("番号を入力してください: ");
         string? choice = Console.ReadLine();
 
@@ -313,19 +299,27 @@ class Program
         }
         else if (choice == "3")
         {
-            bool ok1 = manager.SetApplicationPreference(cameraInfo, "ModelName", "String", "CSHARP_TEST_MODEL");
-            Console.WriteLine("C#: Set ModelName result = " + ok1);
+            bool ok1 = manager.SetApplicationPreference(cameraInfo, "Mode", "Integer", "2");
+            Console.WriteLine("C#: Set Mode result = " + ok1);
 
-            bool ok2 = manager.SetApplicationPreference(cameraInfo, "WorkProcedureName", "String", "CSHARP_TEST_WORK");
-            Console.WriteLine("C#: Set WorkProcedureName result = " + ok2);
+            bool ok2 = manager.SetApplicationPreference(cameraInfo, "CameraStatus", "Integer", "0");
+            Console.WriteLine("C#: Set CameraStatus result = " + ok2);
         }
         else if (choice == "4")
         {
-            string? model = manager.GetApplicationPreference(cameraInfo, "ModelName", "String");
-            string? work = manager.GetApplicationPreference(cameraInfo, "WorkProcedureName", "String");
+            string? mode = manager.GetApplicationPreference(cameraInfo, "Mode", "Integer");
+            string? cameraStatus = manager.GetApplicationPreference(cameraInfo, "CameraStatus", "Integer");
 
-            Console.WriteLine("C#: ModelName = " + model);
-            Console.WriteLine("C#: WorkProcedureName = " + work);
+            Console.WriteLine("C#: Mode = " + mode);
+            Console.WriteLine("C#: CameraStatus = " + cameraStatus);
+        }
+        else if (choice == "5")
+        {
+            bool ok1 = manager.SetApplicationPreference(cameraInfo, "Mode", "Integer", "1");
+            Console.WriteLine("C#: Restore Mode result = " + ok1);
+
+            bool ok2 = manager.SetApplicationPreference(cameraInfo, "CameraStatus", "Integer", "1");
+            Console.WriteLine("C#: Restore CameraStatus result = " + ok2);
         }
         else
         {

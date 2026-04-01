@@ -85,7 +85,6 @@ def UnlockAppPref() -> None:
 
 # =========================================================
 # json更新用関数
-# update_pref の key に対応する項目の Value を更新
 # =========================================================
 def SetAppPref(update_pref: dict) -> bool:
     if not isinstance(update_pref, dict):
@@ -194,16 +193,44 @@ def GetAppPref() -> dict:
 
 
 # =========================================================
-# テスト用関数
-# 本番JSONでは比較的安全なキーを使う
+# 補助: 現在値を直接読む
 # =========================================================
-def test_python_write_production_json():
-    print("Python: ModelName, WorkProcedureName を更新します")
+def direct_read_mode_and_camera_status():
+    if not LockAppPref():
+        print("Python: Lock失敗")
+        return
+
+    try:
+        with open(APP_PREF_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        print("Mode =", data.get("Mode", {}).get("Value"))
+        print("CameraStatus =", data.get("CameraStatus", {}).get("Value"))
+    except Exception as e:
+        print("Python: direct read error:", e)
+    finally:
+        UnlockAppPref()
+
+
+# =========================================================
+# テスト用
+# =========================================================
+def test_python_write():
+    print("Python: Mode=2, CameraStatus=0 に更新します")
     ok = SetAppPref({
-        "ModelName": "PYTHON_TEST_MODEL",
-        "WorkProcedureName": "PYTHON_TEST_WORK"
+        "Mode": "2",
+        "CameraStatus": "0"
     })
     print("Python: SetAppPref result =", ok)
+
+
+def test_python_restore():
+    print("Python: Mode=1, CameraStatus=1 に戻します")
+    ok = SetAppPref({
+        "Mode": "1",
+        "CameraStatus": "1"
+    })
+    print("Python: Restore result =", ok)
 
 
 def test_python_lock_hold():
@@ -236,42 +263,24 @@ def test_wait_csharp_update_and_read():
 
     if prefs:
         print("Python: Wait and Read result")
-        print("ModelName =", prefs.get("ModelName"))
-        print("WorkProcedureName =", prefs.get("WorkProcedureName"))
+        print("Mode =", prefs.get("Mode"))
+        print("CameraStatus =", prefs.get("CameraStatus"))
     else:
         print("Python: 読み取り失敗またはタイムアウト")
 
 
-def test_read_current_json_direct():
-    print("Python: 現在のJSONを直接読みます")
-
-    if not LockAppPref():
-        print("Python: Lock失敗")
-        return
-
-    try:
-        with open(APP_PREF_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        print("ModelName =", data.get("ModelName", {}).get("Value"))
-        print("WorkProcedureName =", data.get("WorkProcedureName", {}).get("Value"))
-    except Exception as e:
-        print("Python: direct read error:", e)
-    finally:
-        UnlockAppPref()
-
-
 if __name__ == "__main__":
     print("=== Python Production JSON Test Menu ===")
-    print("1: Python から ModelName, WorkProcedureName を更新")
+    print("1: Python から Mode=2, CameraStatus=0 に更新")
     print("2: Python でロックして10秒保持")
     print("3: ロックできるか試すだけ")
-    print("4: C#更新待ちして全件読込む")
-    print("5: 今のJSONから ModelName, WorkProcedureName を直接表示")
+    print("4: C#更新待ちして Mode, CameraStatus を読む")
+    print("5: 今のJSONから Mode, CameraStatus を直接表示")
+    print("6: Mode=1, CameraStatus=1 に戻す")
     choice = input("番号を入力してください: ").strip()
 
     if choice == "1":
-        test_python_write_production_json()
+        test_python_write()
     elif choice == "2":
         test_python_lock_hold()
     elif choice == "3":
@@ -279,6 +288,8 @@ if __name__ == "__main__":
     elif choice == "4":
         test_wait_csharp_update_and_read()
     elif choice == "5":
-        test_read_current_json_direct()
+        direct_read_mode_and_camera_status()
+    elif choice == "6":
+        test_python_restore()
     else:
         print("不正な入力です")

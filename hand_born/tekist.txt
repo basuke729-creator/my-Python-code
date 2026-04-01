@@ -1,181 +1,203 @@
+========================
+本番JSONテスト項目（Mode / CameraStatus）
+========================
+
+----------------------------------------
 テスト1
-Python から本番JSONを更新できることの確認
+----------------------------------------
+■ そのテストで何を確認するか
+Python の SetAppPref を使用して、本番JSONの Mode と CameraStatus を更新できることを確認する。
 
-目的
-Python の SetAppPref(update_pref) で本番JSONを更新できること
+■ 手順
+1. 本番JSONを開き、Mode と CameraStatus の現在値を確認し控える。
+   （例：Mode=1、CameraStatus=1）
 
-実施方法
-本番JSONを開いて、初期値を確認する
-特に次の2項目を見る
-ModelName
-WorkProcedureName
-Pythonコードを起動する
-メニューで 1 を入力する
-1: Python から ModelName, WorkProcedureName を更新
-実行後に、本番JSONを直接開いて内容を確認する
-期待結果
-ModelName の Value が PYTHON_TEST_MODEL
-WorkProcedureName の Value が PYTHON_TEST_WORK
+2. Python を起動する
+   python app_pref_python_prod.py
+
+3. メニューで「1」を入力する
+   Python から Mode=2, CameraStatus=0 に更新
+
+4. 実行結果で SetAppPref result = True を確認する
+
+5. 次のいずれかで値を確認する
+   ・Python メニュー「5」
+   ・C# メニュー「4」
+   ・JSONファイルを直接確認
+
+■ 期待結果
+Mode = 2
+CameraStatus = 0
 
 
+----------------------------------------
 テスト2
-名称
+----------------------------------------
+■ そのテストで何を確認するか
+C# の SetApplicationPreference を使用して、本番JSONの Mode と CameraStatus を更新できることを確認する。
 
-C# から本番JSONを更新できることの確認
+■ 手順
+1. C# を起動する
+   dotnet run
 
-目的
+2. メニューで「3」を入力する
+   Mode=2, CameraStatus=0 に更新
 
-以下を確認する。
+3. 実行結果で True が表示されることを確認する
 
-C# の SetApplicationPreference で本番JSONを更新できること
-実施方法
-C# 側を起動する
-dotnet run
-メニューで 3 を入力する
-3: ModelName, WorkProcedureName を更新
-実行後に、本番JSONを直接開いて内容を確認する
-期待結果
-ModelName の Value が CSHARP_TEST_MODEL
-WorkProcedureName の Value が CSHARP_TEST_WORK
-確認できること
-C# 側の SetApplicationPreference が本番JSONで動作する
+4. 次のいずれかで値を確認する
+   ・Python メニュー「5」
+   ・C# メニュー「4」
+   ・JSONファイルを直接確認
+
+■ 期待結果
+Mode = 2
+CameraStatus = 0
+
+
+----------------------------------------
 テスト3
-名称
+----------------------------------------
+■ そのテストで何を確認するか
+Python がロック中の場合、C# がファイルロックできないことを確認する（排他制御確認）。
 
-Pythonロック中にC#がアクセスできないことの確認
+■ 手順
+1. Python を起動する
+   python app_pref_python_prod.py
 
-目的
+2. メニューで「2」を入力する
+   ロックして10秒保持
 
-以下を確認する。
+3. Python がロック中に C# を起動する
+   dotnet run
 
-LockAppPref / UnlockAppPref
-LockApplicationPreference / UnlockApplicationPreference
-更新中や読み込み中に他方から変更できないこと
-実施方法
-Python側を起動する
-python app_pref_python_prod.py
-メニューで 2 を入力する
-2: Python でロックして10秒保持
-その10秒の間に、C#側を起動する
-dotnet run
-C#メニューで 2 を入力する
-2: ロックできるか試すだけ
-期待結果
+4. メニューで「2」を入力する
+   ロックできるか試す
 
-C#側で
-
+■ 期待結果
 C#: Lock result = False
-確認できること
-Pythonロック中はC#がファイルに入れない
-排他制御が成立している
+
+
+----------------------------------------
 テスト4
-名称
+----------------------------------------
+■ そのテストで何を確認するか
+C# がロック中の場合、Python がファイルロックできないことを確認する（双方向排他制御）。
 
-C#ロック中にPythonがアクセスできないことの確認
+■ 手順
+1. C# を起動する
+   dotnet run
 
-目的
+2. メニューで「1」を入力する
+   ロックして10秒保持
 
-以下を確認する。
+3. C# がロック中に Python を起動する
+   python app_pref_python_prod.py
 
-双方向で排他制御が成立していること
-実施方法
-C#側を起動する
-dotnet run
-メニューで 1 を入力する
-1: ロックして10秒保持
-その10秒の間に、Python側を起動する
-python app_pref_python_prod.py
-Pythonメニューで 3 を入力する
-3: ロックできるか試すだけ
-期待結果
+4. メニューで「3」を入力する
+   ロックできるか試す
 
-Python側で
-
+■ 期待結果
 Python: Lock result = False
-確認できること
-C#ロック中はPythonがファイルに入れない
-双方向のロックが有効
+
+
+----------------------------------------
 テスト5
-名称
+----------------------------------------
+■ そのテストで何を確認するか
+Python で更新した Mode と CameraStatus を C# が正しく読み取れることを確認する。
 
-Python更新内容をC#が読めることの確認
+■ 手順
+1. Python を起動する
+   python app_pref_python_prod.py
 
-目的
+2. メニューで「1」を入力する
+   Mode=2, CameraStatus=0 に更新
 
-以下を確認する。
+3. C# を起動する
+   dotnet run
 
-Python → 本番JSON → C# の連携が成立していること
-C# の GetApplicationPreference が本番JSONで読めること
-実施方法
-Python側を起動する
-python app_pref_python_prod.py
-メニューで 1 を入力して更新する
-更新後、C#側を起動する
-dotnet run
-C#メニューで 4 を入力する
-4: ModelName, WorkProcedureName を読む
-期待結果
+4. メニューで「4」を入力する
+   Mode と CameraStatus を読む
 
-C#側で
+■ 期待結果
+C#: Mode = 2
+C#: CameraStatus = 0
 
-C#: ModelName = PYTHON_TEST_MODEL
-C#: WorkProcedureName = PYTHON_TEST_WORK
-確認できること
-Pythonで更新した本番JSONをC#で正しく読める
+
+----------------------------------------
 テスト6
-名称
+----------------------------------------
+■ そのテストで何を確認するか
+C# で更新した Mode と CameraStatus を Python が正しく読み取れることを確認する。
 
-C#更新内容をPythonが読めることの確認
+■ 手順
+1. C# を起動する
+   dotnet run
 
-目的
+2. メニューで「3」を入力する
+   Mode=2, CameraStatus=0 に更新
 
-以下を確認する。
+3. Python を起動する
+   python app_pref_python_prod.py
 
-C# → 本番JSON → Python の連携が成立していること
-実施方法
-C#側を起動する
-dotnet run
-メニューで 3 を入力して更新する
-更新後、Python側を起動する
-python app_pref_python_prod.py
-Pythonメニューで 5 を入力する
-5: 今のJSONから ModelName, WorkProcedureName を直接表示
-期待結果
+4. メニューで「5」を入力する
+   JSONから直接読み取る
 
-Python側で
+■ 期待結果
+Mode = 2
+CameraStatus = 0
 
-ModelName = CSHARP_TEST_MODEL
-WorkProcedureName = CSHARP_TEST_WORK
-確認できること
-C#で更新した本番JSONをPythonで正しく読める
+
+----------------------------------------
 テスト7
-名称
+----------------------------------------
+■ そのテストで何を確認するか
+Python の GetAppPref が、C# の更新を watchdog で検知し、最新の値を取得できることを確認する。
 
-C#更新をPythonが検知して読めることの確認
+■ 手順
+1. Python を起動する
+   python app_pref_python_prod.py
 
-目的
+2. メニューで「4」を入力する
+   更新待ち状態にする
 
-以下を確認する。
+3. Pythonを待機させたまま C# を起動する
+   dotnet run
 
-GetAppPref() が watchdog を使って C# の更新を検知できること
-GetAppPref() が全件辞書で返せること
-実施方法
-Python側を起動する
-python app_pref_python_prod.py
-メニューで 4 を入力する
-4: C#更新待ちして全件読込む
-Python は待機状態になる
-その状態のまま、C#側を起動する
-dotnet run
-C#メニューで 3 を入力する
-ModelName, WorkProcedureName を更新
-期待結果
+4. メニューで「3」を入力する
+   Mode=2, CameraStatus=0 に更新
 
-Python側で
+5. Python側の出力を確認する
 
+■ 期待結果
 Python: Wait and Read result
-ModelName = CSHARP_TEST_MODEL
-WorkProcedureName = CSHARP_TEST_WORK
-確認できること
-C#の更新をPythonが検知できる
-Pythonの GetAppPref() が仕様どおりに動いている
+Mode = 2
+CameraStatus = 0
+
+
+----------------------------------------
+テスト8
+----------------------------------------
+■ そのテストで何を確認するか
+テストで変更した Mode と CameraStatus を元の値に戻せることを確認する。
+
+■ 手順
+1. Python または C# のどちらかで戻す
+
+【Python】
+python app_pref_python_prod.py
+→ メニュー「6」
+
+【C#】
+dotnet run
+→ メニュー「5」
+
+2. 次のいずれかで確認
+   ・Python メニュー「5」
+   ・C# メニュー「4」
+   ・JSONファイル直接確認
+
+■ 期待結果
+Mode = 1
+CameraStatus = 1
