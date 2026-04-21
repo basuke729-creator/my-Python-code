@@ -43,8 +43,8 @@ input_csv = "rectangles.csv"
 FRAME_RATE = 5
 
 def confplot(image, land, conf, flag):
-    def cood(image, pos):
-        return (int(image.shape[1] * pos[0]), int(image.shape[0] * pos[1]))
+    def cood(pos):
+        return (int(pos[0]), int(pos[1]))
 
     lines = [[0, 1], [0, 2], [1, 3], [2, 4], [0, 5], [0, 6], [5, 6], [5, 7], [7, 9],
              [6, 8], [8, 10], [11, 12], [5, 11], [11, 13], [13, 15], [6, 12], [12, 14], [14, 16]]
@@ -58,11 +58,23 @@ def confplot(image, land, conf, flag):
     else:
         color = (0, 255, 0)
 
+    h, w = image.shape[:2]
+
     for lnd in lines:
-        image = cv2.line(image, cood(image, lands[lnd[0]]), cood(image, lands[lnd[1]]), color, 5)
+        p1 = lands[lnd[0]]
+        p2 = lands[lnd[1]]
+
+        # 画面外の座標は描画しない
+        if not (0 <= p1[0] < w and 0 <= p1[1] < h):
+            continue
+        if not (0 <= p2[0] < w and 0 <= p2[1] < h):
+            continue
+
+        image = cv2.line(image, cood(p1), cood(p2), color, 5)
 
     for p, c in zip(lands, conf):
-        image = cv2.circle(image, cood(image, p), 10, color, -1)
+        if 0 <= p[0] < w and 0 <= p[1] < h:
+            image = cv2.circle(image, cood(p), 10, color, -1)
 
     return image
 
