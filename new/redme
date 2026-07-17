@@ -22,3 +22,7 @@ python yolox_effnetv2_pipeline_final.py \
   --max-frames 10
 
   python -c "import importlib.util; p='exps/custom/yolox_tiny_custom.py'; s=importlib.util.spec_from_file_location('custom_exp', p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print('Exp exists:', hasattr(m, 'Exp')); print('Exp:', getattr(m, 'Exp', None))"
+
+find /home/yamanao/yolox_effnetv2/YOLOX/exps/custom \ -type d -name "__pycache__" -exec rm -rf {} +
+
+  python -c "from yolox.exp import get_exp; exp=get_exp('/home/yamanao/yolox_effnetv2/YOLOX/exps/custom/yolox_tiny_custom.py', None); print('get_exp OK'); print(type(exp)); print('num_classes:', exp.num_classes)"
