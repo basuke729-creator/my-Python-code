@@ -20,6 +20,8 @@ python yolox_effnetv2_pipeline_final.py \
   --jpg-quality 95 \
   --warmup 2 \
   --max-frames 10
+  --save-crops "/home/yamanao/yolox_effnetv2/outputs/test/crops" \
+  --cross-matrix-dir "/home/yamanao/yolox_effnetv2/outputs/test/cross_matrix" \
 
 import importlib.util
 
