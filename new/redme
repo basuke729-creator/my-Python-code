@@ -21,8 +21,29 @@ python yolox_effnetv2_pipeline_final.py \
   --warmup 2 \
   --max-frames 10
 
-  python -c "import importlib.util; p='exps/custom/yolox_tiny_custom.py'; s=importlib.util.spec_from_file_location('custom_exp', p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print('Exp exists:', hasattr(m, 'Exp')); print('Exp:', getattr(m, 'Exp', None))"
+class YOLOXDetector:
+    def __init__(self, args):
+        import importlib.util
 
-find /home/yamanao/yolox_effnetv2/YOLOX/exps/custom \ -type d -name "__pycache__" -exec rm -rf {} +
+        exp_path = os.path.abspath(args.yolox_exp)
+        module_name = f"yolox_custom_exp_{abs(hash(exp_path))}"
 
-  python -c "from yolox.exp import get_exp; exp=get_exp('/home/yamanao/yolox_effnetv2/YOLOX/exps/custom/yolox_tiny_custom.py', None); print('get_exp OK'); print(type(exp)); print('num_classes:', exp.num_classes)"
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            exp_path
+        )
+
+        if spec is None or spec.loader is None:
+            raise ImportError(
+                f"YOLOX expファイルを読み込めません: {exp_path}"
+            )
+
+        exp_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(exp_module)
+
+        if not hasattr(exp_module, "Exp"):
+            raise ImportError(
+                f"{exp_path} に Exp クラスがありません。"
+            )
+
+        exp = exp_module.Exp()"
