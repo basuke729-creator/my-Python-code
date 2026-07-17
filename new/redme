@@ -20,3 +20,5 @@ python yolox_effnetv2_pipeline_final.py \
   --jpg-quality 95 \
   --warmup 2 \
   --max-frames 10
+
+  python -c "import importlib.util; p='exps/custom/yolox_tiny_custom.py'; s=importlib.util.spec_from_file_location('custom_exp', p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print('Exp exists:', hasattr(m, 'Exp')); print('Exp:', getattr(m, 'Exp', None))"
