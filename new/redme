@@ -1,0 +1,22 @@
+python yolox_effnetv2_pipeline_final.py \
+  --input-video "/home/yamanao/yolox_effnetv2/videos/R0010117.MP4" \
+  --yolox-root "/home/yamanao/yolox_effnetv2/YOLOX" \
+  --yolox-exp "/home/yamanao/yolox_effnetv2/YOLOX/exps/custom/yolox_tiny_custom.py" \
+  --yolox-name "yolox-tiny-custom" \
+  --yolox-ckpt "/home/yamanao/yolox_effnetv2/YOLOX/YOLOX_outputs/yolox_tiny_custom/best_ckpt.pth" \
+  --yolox-conf 0.2 \
+  --yolox-nms 0.45 \
+  --yolox-tsize-h 960 \
+  --yolox-tsize-w 1920 \
+  --eff-ckpt "/home/yamanao/yolox_effnetv2/models/efficientnetv2/best.ckpt" \
+  --eff-model tf_efficientnetv2_m \
+  --eff-img-size 384 \
+  --eff-resize-mode pad \
+  --eff-bg black \
+  --crop-scale 1.25 \
+  --output-frames "/home/yamanao/yolox_effnetv2/outputs/test/frames" \
+  --output-csv "/home/yamanao/yolox_effnetv2/outputs/test/predictions.csv" \
+  --save-every 1 \
+  --jpg-quality 95 \
+  --warmup 2 \
+  --max-frames 10
