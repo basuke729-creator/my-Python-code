@@ -41,3 +41,89 @@ if not hasattr(exp_module, "Exp"):
     )
 
 exp = exp_module.Exp()
+
+# ============================================================
+# YOLOX側の表示順
+# ============================================================
+yolox_order = [
+    "1st stepladder",
+    "2nd stepladder",
+    "person N/A",
+    "safe stepladder",
+    "safe workplatform",
+    "stepladder",
+    "straddling",
+    "unstable stepladder",
+    "workplatform",
+    "unstable workplatform",
+]
+
+# ============================================================
+# EfficientNetV2側の表示順
+# YOLOX側と意味が対応する順番
+# ============================================================
+effnet_order = [
+    "脚立1段目の人",
+    "脚立2段目の人",
+    "その他の人",
+    "脚立上の安全な人",
+    "立馬上の安全な人",
+    "脚立",
+    "脚立を跨ぐ人",
+    "脚立上の不安定姿勢の人",
+    "立馬",
+    "立馬上の不安定姿勢の人",
+]
+
+# ============================================================
+# 実際に行列内に存在する行・列を優先順に並べる
+# 存在しないクラス名は無視する
+# 未定義のクラスがあれば末尾に残す
+# ============================================================
+ordered_rows = [
+    class_name
+    for class_name in yolox_order
+    if class_name in count_matrix.index
+]
+
+remaining_rows = [
+    class_name
+    for class_name in count_matrix.index
+    if class_name not in ordered_rows
+]
+
+final_row_order = ordered_rows + remaining_rows
+
+
+ordered_columns = [
+    class_name
+    for class_name in effnet_order
+    if class_name in count_matrix.columns
+]
+
+remaining_columns = [
+    class_name
+    for class_name in count_matrix.columns
+    if class_name not in ordered_columns
+]
+
+final_column_order = ordered_columns + remaining_columns
+
+
+# ============================================================
+# カウント行列を並べ替え
+# ============================================================
+count_matrix = count_matrix.reindex(
+    index=final_row_order,
+    columns=final_column_order,
+    fill_value=0,
+)
+
+# ============================================================
+# 比率行列を並べ替え
+# ============================================================
+ratio_matrix = ratio_matrix.reindex(
+    index=final_row_order,
+    columns=final_column_order,
+    fill_value=0.0,
+)
