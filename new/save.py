@@ -1,22 +1,10 @@
 def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
     """
-    YOLOXの検出クラスとEfficientNetV2の分類クラスから
-    クロス集計表とヒートマップを作成する。
+    YOLOXの検出結果とEfficientNetV2の分類結果をクロス集計し、
+    件数・行方向割合のCSVとヒートマップを保存する。
 
-    注意:
-        これは正解ラベルを使用した混同行列ではなく、
-        YOLOX予測 × EfficientNetV2予測のクロス集計である。
-
-    Parameters
-    ----------
-    output_csv : str or pathlib.Path
-        推論結果CSVのパス
-
-    matrix_dir : str or pathlib.Path
-        クロス集計結果の保存先ディレクトリ
-
-    matrix_font : str or pathlib.Path or None
-        日本語フォントファイルのパス
+    ※正解ラベルを使用した混同行列ではなく、
+      YOLOX予測 × EfficientNetV2予測のクロス集計。
     """
 
     from pathlib import Path
@@ -28,7 +16,7 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
 
 
     # ============================================================
-    # 入出力パス
+    # パス設定
     # ============================================================
     output_csv = Path(output_csv)
     matrix_dir = Path(matrix_dir)
@@ -39,50 +27,41 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
     )
 
     if not output_csv.exists():
-        print(f"[WARN] CSV file not found: {output_csv}")
+        print(f"[WARN] CSV not found: {output_csv}")
         return
 
 
     # ============================================================
-    # CSV読み込み
+    # 推論結果CSVを読み込む
     # ============================================================
-    try:
-        df = pd.read_csv(output_csv)
-    except Exception as exc:
-        print(f"[WARN] Failed to read CSV: {output_csv}")
-        print(f"[WARN] {exc}")
-        return
+    df = pd.read_csv(output_csv)
 
     if df.empty:
         print("[WARN] Prediction CSV is empty.")
-        print("[WARN] Cross matrices were not generated.")
         return
 
 
     # ============================================================
-    # YOLOX列・EfficientNetV2列を探す
+    # CSV内のクラス名列を取得
     #
-    # 現在のCSVに合わせて、候補名を複数用意している。
+    # 現在のCSVの列名に応じて候補から検索する
     # ============================================================
     yolox_column_candidates = [
-        "yolox_class_name",
         "yolox_class",
-        "yolo_class_name",
+        "yolox_class_name",
         "yolo_class",
-        "yolox_cls_name",
-        "yolo_cls_name",
+        "yolo_class_name",
         "yolox_cls",
         "yolo_cls",
     ]
 
     effnet_column_candidates = [
-        "effnet_class_name",
-        "effnet_class",
-        "eff_class_name",
         "eff_class",
-        "efficientnet_class_name",
+        "eff_class_name",
+        "effnet_class",
+        "effnet_class_name",
         "efficientnet_class",
-        "effnet_cls_name",
+        "efficientnet_class_name",
         "effnet_cls",
     ]
 
@@ -105,27 +84,18 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
     )
 
     if yolox_column is None or effnet_column is None:
-        print("[WARN] YOLOX or EfficientNetV2 class column was not found.")
+        print("[WARN] Class-name columns were not found.")
         print(f"[INFO] CSV columns: {list(df.columns)}")
-        print(
-            "[INFO] Edit yolox_column_candidates and "
-            "effnet_column_candidates if necessary."
-        )
         return
 
 
     # ============================================================
-    # 欠損データを除外
+    # クラス名を文字列に統一
     # ============================================================
     matrix_df = df[
         [yolox_column, effnet_column]
     ].dropna().copy()
 
-    if matrix_df.empty:
-        print("[WARN] No valid YOLOX/EfficientNetV2 predictions found.")
-        return
-
-    # クラス名を文字列に統一し、余分な空白を除去
     matrix_df[yolox_column] = (
         matrix_df[yolox_column]
         .astype(str)
@@ -138,13 +108,37 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
         .str.strip()
     )
 
+    if matrix_df.empty:
+        print("[WARN] No valid class data found.")
+        return
+
 
     # ============================================================
-    # 表示順
-    #
-    # ユーザー指定のYOLOX側の並びに合わせて、
-    # EfficientNetV2側も意味が対応する順番にする。
+    # 件数クロス集計を作成
     # ============================================================
+    count_matrix = pd.crosstab(
+        matrix_df[yolox_column],
+        matrix_df[effnet_column],
+        dropna=False,
+    )
+
+
+    # ============================================================
+    # 行方向の割合を作成
+    # ============================================================
+    ratio_matrix = count_matrix.div(
+        count_matrix.sum(axis=1).replace(0, np.nan),
+        axis=0,
+    ) * 100.0
+
+    ratio_matrix = ratio_matrix.fillna(0.0)
+
+
+    # ============================================================
+    # 今回追加するクラス順の並び替え
+    # ============================================================
+
+    # 縦軸：YOLOX
     yolox_order = [
         "1st stepladder",
         "2nd stepladder",
@@ -158,6 +152,8 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
         "unstable workplatform",
     ]
 
+    # 横軸：EfficientNetV2
+    # YOLOX側と意味が対応する順番
     effnet_order = [
         "脚立1段目の人",
         "脚立2段目の人",
@@ -172,100 +168,78 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
     ]
 
 
-    # ============================================================
-    # YOLOXクラス名の大文字・小文字差を吸収
-    #
-    # 実際のCSVが
-    #   Person N/A
-    #   Safe stepladder
-    # のような表記でも、指定順に並ぶようにする。
-    # ============================================================
-    yolox_name_lookup = {
+    # ------------------------------------------------------------
+    # YOLOX側：
+    # 大文字・小文字の違いを吸収して実データの名前を取得する
+    # ------------------------------------------------------------
+    actual_yolox_names = {
         str(name).strip().lower(): str(name).strip()
-        for name in matrix_df[yolox_column].unique()
+        for name in count_matrix.index
     }
 
-    resolved_yolox_order = []
+    ordered_rows = []
 
     for requested_name in yolox_order:
-        actual_name = yolox_name_lookup.get(
+        actual_name = actual_yolox_names.get(
             requested_name.lower()
         )
 
         if actual_name is not None:
-            resolved_yolox_order.append(actual_name)
-        else:
-            # 動画中に出現していない場合も、指定表記で行を残す
-            resolved_yolox_order.append(requested_name)
+            ordered_rows.append(actual_name)
 
 
-    # ============================================================
-    # 件数クロス集計
-    # ============================================================
-    count_matrix = pd.crosstab(
-        matrix_df[yolox_column],
-        matrix_df[effnet_column],
-        dropna=False,
-    )
-
-
-    # ============================================================
-    # 指定外のクラスが存在した場合、最後尾へ残す
-    # ============================================================
-    extra_yolox_classes = [
-        class_name
-        for class_name in count_matrix.index
-        if class_name not in resolved_yolox_order
+    # 指定リストにないYOLOXクラスがあれば末尾に残す
+    remaining_rows = [
+        name
+        for name in count_matrix.index
+        if name not in ordered_rows
     ]
 
-    extra_effnet_classes = [
-        class_name
-        for class_name in count_matrix.columns
-        if class_name not in effnet_order
+    final_row_order = ordered_rows + remaining_rows
+
+
+    # ------------------------------------------------------------
+    # EfficientNetV2側：
+    # 実際に存在する列を指定順に並べる
+    # ------------------------------------------------------------
+    ordered_columns = [
+        name
+        for name in effnet_order
+        if name in count_matrix.columns
     ]
 
-    final_yolox_order = (
-        resolved_yolox_order
-        + extra_yolox_classes
+
+    # 指定リストにないEfficientNetV2クラスがあれば末尾に残す
+    remaining_columns = [
+        name
+        for name in count_matrix.columns
+        if name not in ordered_columns
+    ]
+
+    final_column_order = (
+        ordered_columns
+        + remaining_columns
     )
 
-    final_effnet_order = (
-        effnet_order
-        + extra_effnet_classes
-    )
 
-
-    # ============================================================
-    # 件数行列を並べ替え
-    #
-    # 出現しなかったクラスは0で補完する。
-    # ============================================================
+    # ------------------------------------------------------------
+    # 件数行列と割合行列を同じ順番に並べ替える
+    # ------------------------------------------------------------
     count_matrix = count_matrix.reindex(
-        index=final_yolox_order,
-        columns=final_effnet_order,
+        index=final_row_order,
+        columns=final_column_order,
         fill_value=0,
     )
 
-
-    # ============================================================
-    # 行ごとの割合行列を作成
-    #
-    # 各YOLOXクラスについて、
-    # EfficientNetV2がどのクラスへ分類したかを%で表す。
-    # ============================================================
-    row_totals = count_matrix.sum(axis=1)
-
-    ratio_matrix = count_matrix.div(
-        row_totals.replace(0, np.nan),
-        axis=0,
-    ) * 100.0
-
-    # 該当データがない行は0.0%
-    ratio_matrix = ratio_matrix.fillna(0.0)
+    ratio_matrix = ratio_matrix.reindex(
+        index=final_row_order,
+        columns=final_column_order,
+        fill_value=0.0,
+    )
 
 
     # ============================================================
-    # 出力パス
+    # 保存先
     # ============================================================
     count_csv_path = (
         matrix_dir
@@ -305,6 +279,8 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
 
     # ============================================================
     # 日本語フォント設定
+    #
+    # 修正前に使用していた --matrix-font の指定をそのまま使用
     # ============================================================
     font_properties = None
 
@@ -312,101 +288,85 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
         matrix_font = Path(matrix_font)
 
         if matrix_font.exists():
-            try:
-                font_properties = (
-                    font_manager.FontProperties(
-                        fname=str(matrix_font)
-                    )
-                )
-            except Exception as exc:
-                print(
-                    "[WARN] Failed to load matrix font: "
-                    f"{matrix_font}"
-                )
-                print(f"[WARN] {exc}")
+            font_properties = font_manager.FontProperties(
+                fname=str(matrix_font)
+            )
         else:
             print(
-                "[WARN] Matrix font file not found: "
-                f"{matrix_font}"
+                f"[WARN] Font file not found: {matrix_font}"
             )
 
 
     # ============================================================
-    # ヒートマップ描画関数
+    # ヒートマップ描画
     # ============================================================
     def plot_matrix(
         matrix,
         output_path,
         title,
-        value_format,
-        color_max=None,
+        is_ratio=False,
     ):
-        rows, columns = matrix.shape
+        row_count, column_count = matrix.shape
 
-        # クラス数に合わせて画像サイズを調整
-        figure_width = max(
-            12.0,
-            columns * 1.25,
+        fig_width = max(
+            12,
+            column_count * 1.2,
         )
 
-        figure_height = max(
-            8.0,
-            rows * 0.75,
+        fig_height = max(
+            8,
+            row_count * 0.75,
         )
 
         fig, ax = plt.subplots(
-            figsize=(figure_width, figure_height)
+            figsize=(fig_width, fig_height)
         )
 
         values = matrix.to_numpy(
             dtype=float
         )
 
-        if color_max is None:
+        if is_ratio:
             image = ax.imshow(
                 values,
-                aspect="auto",
                 cmap="Blues",
+                aspect="auto",
                 interpolation="nearest",
+                vmin=0,
+                vmax=100,
             )
         else:
             image = ax.imshow(
                 values,
-                aspect="auto",
                 cmap="Blues",
+                aspect="auto",
                 interpolation="nearest",
-                vmin=0,
-                vmax=color_max,
             )
 
+
+        # カラーバー
         colorbar = fig.colorbar(
             image,
             ax=ax,
-            fraction=0.046,
-            pad=0.04,
         )
 
-        if color_max == 100:
-            colorbar.set_label(
-                "Percentage (%)",
-                fontproperties=font_properties,
-            )
+        if is_ratio:
+            colorbar.set_label("Percentage (%)")
         else:
-            colorbar.set_label(
-                "Count",
-                fontproperties=font_properties,
-            )
+            colorbar.set_label("Count")
 
 
-        # 軸ラベル
+        # 軸目盛り
         ax.set_xticks(
-            np.arange(columns)
+            np.arange(column_count)
         )
 
         ax.set_yticks(
-            np.arange(rows)
+            np.arange(row_count)
         )
 
+
+        # 横軸ラベル
         ax.set_xticklabels(
             matrix.columns,
             rotation=55,
@@ -415,58 +375,50 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
             fontproperties=font_properties,
         )
 
+
+        # 縦軸ラベル
         ax.set_yticklabels(
             matrix.index,
             fontproperties=font_properties,
         )
 
+
         ax.set_xlabel(
-            "EfficientNetV2 classification",
-            fontproperties=font_properties,
-            fontsize=13,
+            "EfficientNetV2 classification"
         )
 
         ax.set_ylabel(
-            "YOLOX detection",
-            fontproperties=font_properties,
-            fontsize=13,
+            "YOLOX detection"
         )
 
         ax.set_title(
-            title,
-            fontproperties=font_properties,
-            fontsize=15,
-            pad=14,
+            title
         )
 
 
         # ========================================================
-        # セル内に数値を表示
+        # セル内に値を表示
         # ========================================================
         if values.size > 0:
-            display_max = float(
+            maximum_value = float(
                 np.nanmax(values)
             )
         else:
-            display_max = 0.0
+            maximum_value = 0.0
 
-        threshold = (
-            display_max * 0.5
-            if display_max > 0
-            else 0.0
-        )
+        threshold = maximum_value / 2.0
 
-        for row_index in range(rows):
-            for column_index in range(columns):
+        for row_index in range(row_count):
+            for column_index in range(column_count):
                 value = values[
                     row_index,
-                    column_index,
+                    column_index
                 ]
 
-                if value_format == "count":
-                    display_text = f"{int(round(value))}"
+                if is_ratio:
+                    text = f"{value:.1f}"
                 else:
-                    display_text = f"{value:.1f}"
+                    text = f"{int(value)}"
 
                 text_color = (
                     "white"
@@ -477,7 +429,7 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
                 ax.text(
                     column_index,
                     row_index,
-                    display_text,
+                    text,
                     ha="center",
                     va="center",
                     color=text_color,
@@ -485,30 +437,6 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
                     fontproperties=font_properties,
                 )
 
-
-        # セル境界を見やすくする
-        ax.set_xticks(
-            np.arange(-0.5, columns, 1),
-            minor=True,
-        )
-
-        ax.set_yticks(
-            np.arange(-0.5, rows, 1),
-            minor=True,
-        )
-
-        ax.grid(
-            which="minor",
-            color="white",
-            linestyle="-",
-            linewidth=0.7,
-        )
-
-        ax.tick_params(
-            which="minor",
-            bottom=False,
-            left=False,
-        )
 
         fig.tight_layout()
 
@@ -528,11 +456,10 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
         matrix=count_matrix,
         output_path=count_png_path,
         title=(
-            "YOLOX–EfficientNetV2 Cross Matrix "
-            "(count)"
+            "YOLOX–EfficientNetV2 "
+            "Cross Matrix (count)"
         ),
-        value_format="count",
-        color_max=None,
+        is_ratio=False,
     )
 
 
@@ -543,22 +470,21 @@ def save_cross_matrices(output_csv, matrix_dir, matrix_font=None):
         matrix=ratio_matrix,
         output_path=ratio_png_path,
         title=(
-            "YOLOX–EfficientNetV2 Cross Matrix "
-            "(row normalized, %)"
+            "YOLOX–EfficientNetV2 "
+            "Cross Matrix (row normalized, %)"
         ),
-        value_format="ratio",
-        color_max=100,
+        is_ratio=True,
     )
 
 
     # ============================================================
-    # 出力結果表示
+    # 出力結果
     # ============================================================
     print("\n=== Cross matrix outputs ===")
-    print(f"Count CSV    : {count_csv_path}")
-    print(f"Ratio CSV    : {ratio_csv_path}")
-    print(f"Count image  : {count_png_path}")
-    print(f"Ratio image  : {ratio_png_path}")
+    print(f"Count CSV   : {count_csv_path}")
+    print(f"Ratio CSV   : {ratio_csv_path}")
+    print(f"Count image : {count_png_path}")
+    print(f"Ratio image : {ratio_png_path}")
 
     print(
         "\n[INFO] These are prediction cross tables, "
