@@ -45,3 +45,7 @@ Gst.init(None)
 print("PyGObject: OK")
 print("GStreamer:", Gst.version_string())
 PY
+
+echo 'export CUDA_HOME=/usr/local/cuda-12.2' >> ~/.bashrc
+echo 'export PATH=/usr/local/cuda-12.2/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
