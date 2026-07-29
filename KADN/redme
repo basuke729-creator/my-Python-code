@@ -49,3 +49,15 @@ PY
 echo 'export CUDA_HOME=/usr/local/cuda-12.2' >> ~/.bashrc
 echo 'export PATH=/usr/local/cuda-12.2/bin:$PATH' >> ~/.bashrc
 echo 'export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+
+python - <<'PY'
+import pycuda.driver as cuda
+
+cuda.init()
+
+print("PyCUDA: OK")
+print("CUDA devices:", cuda.Device.count())
+
+for index in range(cuda.Device.count()):
+    print(index, cuda.Device(index).name())
+PY
