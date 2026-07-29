@@ -1,63 +1,15 @@
 環境構築
-sudo apt update
-sudo apt install -y \
-    python3-venv \
-    python3-dev \
-    python3-tk \
-    python3-gi \
-    python3-gi-cairo \
-    gir1.2-gstreamer-1.0 \
-    gir1.2-gst-plugins-base-1.0 \
-    gstreamer1.0-tools \
-    gstreamer1.0-plugins-base \
-    gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad \
-    gstreamer1.0-plugins-ugly \
-    gstreamer1.0-libav \
-    build-essential \
-    pkg-config \
-    libgl1 \
-    libglib2.0-0 \
-    wget
+python -m pip install \
+    --extra-index-url https://pypi.nvidia.com \
+    tensorrt-cu12-libs==10.3.0 \
+    tensorrt-cu12-bindings==10.3.0 \
+    tensorrt-cu12==10.3.0
+python -m pip install \
+    --extra-index-url https://pypi.nvidia.com \
+    tensorrt==10.3.0
 
 python - <<'PY'
-import cv2
-import numpy
-import av
-from PIL import Image
+import tensorrt as trt
 
-print("OpenCV:", cv2.__version__)
-print("NumPy:", numpy.__version__)
-print("PyAV:", av.__version__)
-print("Pillow: OK")
-PY
-
-python - <<'PY'
-import gi
-
-gi.require_version("Gst", "1.0")
-gi.require_version("GstApp", "1.0")
-
-from gi.repository import Gst, GstApp, GLib
-
-Gst.init(None)
-
-print("PyGObject: OK")
-print("GStreamer:", Gst.version_string())
-PY
-
-echo 'export CUDA_HOME=/usr/local/cuda-12.2' >> ~/.bashrc
-echo 'export PATH=/usr/local/cuda-12.2/bin:$PATH' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
-
-python - <<'PY'
-import pycuda.driver as cuda
-
-cuda.init()
-
-print("PyCUDA: OK")
-print("CUDA devices:", cuda.Device.count())
-
-for index in range(cuda.Device.count()):
-    print(index, cuda.Device(index).name())
+print("TensorRT:", trt.__version__)
 PY
