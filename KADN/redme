@@ -19,3 +19,29 @@ sudo apt install -y \
     libgl1 \
     libglib2.0-0 \
     wget
+
+python - <<'PY'
+import cv2
+import numpy
+import av
+from PIL import Image
+
+print("OpenCV:", cv2.__version__)
+print("NumPy:", numpy.__version__)
+print("PyAV:", av.__version__)
+print("Pillow: OK")
+PY
+
+python - <<'PY'
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GstApp", "1.0")
+
+from gi.repository import Gst, GstApp, GLib
+
+Gst.init(None)
+
+print("PyGObject: OK")
+print("GStreamer:", Gst.version_string())
+PY
