@@ -25,3 +25,13 @@ print("postprocess: OK")
 print("DetectionVisualizer: OK")
 print("class count:", len(CLASS_NAME_MAP))
 PY
+
+python - <<'PY'
+from trt.tensorrt_inferencer import TensorRTInferencer
+
+engine_path = "model/yolox_tiny_20251205_op18.trt"
+
+inferencer = TensorRTInferencer(engine_path)
+print("TensorRT engine load: OK")
+inferencer.destroy()
+PY
