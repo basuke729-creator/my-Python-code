@@ -13,3 +13,15 @@ import tensorrt as trt
 
 print("TensorRT:", trt.__version__)
 PY
+
+python - <<'PY'
+from trt.tensorrt_inferencer import TensorRTInferencer
+from yolox import postprocess
+from visualization.classes import CLASS_NAME_MAP
+from visualization.visualize_detection import DetectionVisualizer
+
+print("TensorRTInferencer: OK")
+print("postprocess: OK")
+print("DetectionVisualizer: OK")
+print("class count:", len(CLASS_NAME_MAP))
+PY
