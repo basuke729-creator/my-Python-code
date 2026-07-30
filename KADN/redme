@@ -101,3 +101,40 @@ def infer(self, inputs: np.ndarray, output_shape: tuple):
 
     finally:
         self.cfx.pop()
+
+    def __init__(self, engine_path):
+        cuda.init()
+        self.cfx = cuda.Device(0).make_context()
+
+        try:
+            self.stream = cuda.Stream()
+
+            self.logger = trt.Logger(trt.Logger.WARNING)
+            self.runtime = trt.Runtime(self.logger)
+            self.engine = self.load_engine(engine_path)
+
+            if self.engine is None:
+                raise RuntimeError(
+                    f"TensorRTエンジンを読み込めませんでした: {engine_path}"
+                )
+
+            self.context = self.engine.create_execution_context()
+
+            if self.context is None:
+                raise RuntimeError(
+                    "TensorRT ExecutionContextを作成できませんでした"
+                )
+
+            self.inputs, self.outputs, self.bindings = (
+                self.allocate_buffers(self.engine)
+            )
+
+            for i in range(self.engine.num_io_tensors):
+                tensor_name = self.engine.get_tensor_name(i)
+                self.context.set_tensor_address(
+                    tensor_name,
+                    self.bindings[i]
+                )
+
+        finally:
+            self.cfx.pop()
