@@ -178,3 +178,21 @@ for i in range(engine.num_io_tensors):
 
 print("TensorRT metadata OK", flush=True)
 PY
+
+PYTHONUNBUFFERED=1 python -X faulthandler - <<'PY'
+from trt.tensorrt_inferencer import TensorRTInferencer
+
+engine_path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
+
+print("1: TensorRTInferencerを初期化します", flush=True)
+
+inferencer = TensorRTInferencer(engine_path)
+
+print("2: 初期化成功", flush=True)
+print("input buffers:", len(inferencer.inputs), flush=True)
+print("output buffers:", len(inferencer.outputs), flush=True)
+
+inferencer.destroy()
+
+print("3: destroy成功", flush=True)
+PY
