@@ -7,3 +7,8 @@ python -c "import tensorrt as trt; print(trt.__version__)"
 export TRT_HOME=$HOME/TensorRT/TensorRT-10.3.0.26
 export PATH=$TRT_HOME/targets/x86_64-linux-gnu/bin:$PATH
 export LD_LIBRARY_PATH=$TRT_HOME/targets/x86_64-linux-gnu/lib:$LD_LIBRARY_PATH
+
+echo 'export TRT_HOME=$HOME/TensorRT/TensorRT-10.3.0.26' >> ~/.bashrc
+echo 'export PATH=$TRT_HOME/targets/x86_64-linux-gnu/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=$TRT_HOME/targets/x86_64-linux-gnu/lib:/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
