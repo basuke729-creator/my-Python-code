@@ -3,3 +3,7 @@ lsb_release -a
 uname -m
 /usr/local/cuda-12.2/bin/nvcc --version
 python -c "import tensorrt as trt; print(trt.__version__)"
+
+export TRT_HOME=$HOME/TensorRT/TensorRT-10.3.0.26
+export PATH=$TRT_HOME/targets/x86_64-linux-gnu/bin:$PATH
+export LD_LIBRARY_PATH=$TRT_HOME/targets/x86_64-linux-gnu/lib:$LD_LIBRARY_PATH
