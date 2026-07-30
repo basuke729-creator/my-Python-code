@@ -1,14 +1,103 @@
-環境構築
-lsb_release -a
-uname -m
-/usr/local/cuda-12.2/bin/nvcc --version
-python -c "import tensorrt as trt; print(trt.__version__)"
+def __init__(self, engine_path):
+    self.cfx = cuda.Device(0).make_context()
 
-export TRT_HOME=$HOME/TensorRT/TensorRT-10.3.0.26
-export PATH=$TRT_HOME/targets/x86_64-linux-gnu/bin:$PATH
-export LD_LIBRARY_PATH=$TRT_HOME/targets/x86_64-linux-gnu/lib:$LD_LIBRARY_PATH
+    try:
+        self.stream = cuda.Stream()
 
-echo 'export TRT_HOME=$HOME/TensorRT/TensorRT-10.3.0.26' >> ~/.bashrc
-echo 'export PATH=$TRT_HOME/targets/x86_64-linux-gnu/bin:$PATH' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=$TRT_HOME/targets/x86_64-linux-gnu/lib:/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
-source ~/.bashrc
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        self.runtime = trt.Runtime(self.logger)
+        self.engine = self.load_engine(engine_path)
+
+        if self.engine is None:
+            raise RuntimeError(f"TensorRTエンジンを読み込めませんでした: {engine_path}")
+
+        self.context = self.engine.create_execution_context()
+
+        if self.context is None:
+            raise RuntimeError("TensorRT ExecutionContextを作成できませんでした")
+
+        self.inputs, self.outputs, self.bindings = self.allocate_buffers(
+            self.engine
+        )
+
+        for i in range(self.engine.num_io_tensors):
+            tensor_name = self.engine.get_tensor_name(i)
+            self.context.set_tensor_address(
+                tensor_name,
+                self.bindings[i]
+            )
+    finally:
+        # make_context()でpushされたコンテキストを解除
+        self.cfx.pop()
+
+def allocate_buffers(self, engine):
+    inputs = []
+    outputs = []
+    bindings = []
+
+    for i in range(engine.num_io_tensors):
+        tensor_name = engine.get_tensor_name(i)
+        tensor_shape = tuple(engine.get_tensor_shape(tensor_name))
+        tensor_dtype = trt.nptype(engine.get_tensor_dtype(tensor_name))
+
+        print(
+            f"[TensorRT] name={tensor_name}, "
+            f"shape={tensor_shape}, dtype={tensor_dtype}"
+        )
+
+        if any(dim < 0 for dim in tensor_shape):
+            raise RuntimeError(
+                f"動的なテンソル形状が未設定です: "
+                f"{tensor_name}={tensor_shape}"
+            )
+
+        size = int(np.prod(tensor_shape))
+
+        if size <= 0:
+            raise RuntimeError(
+                f"不正なテンソルサイズです: "
+                f"{tensor_name}, shape={tensor_shape}"
+            )
+
+        host_mem = cuda.pagelocked_empty(size, tensor_dtype)
+        device_mem = cuda.mem_alloc(host_mem.nbytes)
+
+        bindings.append(int(device_mem))
+
+        memory = self.HostDeviceMem(host_mem, device_mem)
+
+        if engine.get_tensor_mode(tensor_name) == trt.TensorIOMode.INPUT:
+            inputs.append(memory)
+        else:
+            outputs.append(memory)
+
+    return inputs, outputs, bindings
+
+def infer(self, inputs: np.ndarray, output_shape: tuple):
+    self.cfx.push()
+
+    try:
+        np.copyto(self.inputs[0].host, inputs.ravel())
+
+        cuda.memcpy_htod_async(
+            self.inputs[0].device,
+            self.inputs[0].host,
+            self.stream
+        )
+
+        self.context.execute_async_v3(
+            stream_handle=self.stream.handle
+        )
+
+        cuda.memcpy_dtoh_async(
+            self.outputs[0].host,
+            self.outputs[0].device,
+            self.stream
+        )
+
+        self.stream.synchronize()
+
+        return self.outputs[0].host.reshape(output_shape).copy()
+
+    finally:
+        self.cfx.pop()
