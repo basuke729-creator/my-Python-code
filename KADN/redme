@@ -1,37 +1,5 @@
 環境構築
-python -m pip install \
-    --extra-index-url https://pypi.nvidia.com \
-    tensorrt-cu12-libs==10.3.0 \
-    tensorrt-cu12-bindings==10.3.0 \
-    tensorrt-cu12==10.3.0
-python -m pip install \
-    --extra-index-url https://pypi.nvidia.com \
-    tensorrt==10.3.0
-
-python - <<'PY'
-import tensorrt as trt
-
-print("TensorRT:", trt.__version__)
-PY
-
-python - <<'PY'
-from trt.tensorrt_inferencer import TensorRTInferencer
-from yolox import postprocess
-from visualization.classes import CLASS_NAME_MAP
-from visualization.visualize_detection import DetectionVisualizer
-
-print("TensorRTInferencer: OK")
-print("postprocess: OK")
-print("DetectionVisualizer: OK")
-print("class count:", len(CLASS_NAME_MAP))
-PY
-
-python - <<'PY'
-from trt.tensorrt_inferencer import TensorRTInferencer
-
-engine_path = "model/yolox_tiny_20251205_op18.trt"
-
-inferencer = TensorRTInferencer(engine_path)
-print("TensorRT engine load: OK")
-inferencer.destroy()
-PY
+lsb_release -a
+uname -m
+/usr/local/cuda-12.2/bin/nvcc --version
+python -c "import tensorrt as trt; print(trt.__version__)"
