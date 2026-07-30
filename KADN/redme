@@ -138,3 +138,43 @@ def infer(self, inputs: np.ndarray, output_shape: tuple):
 
         finally:
             self.cfx.pop()
+
+python -X faulthandler - <<'PY'
+import tensorrt as trt
+
+path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
+
+print("1: TensorRT", trt.__version__, flush=True)
+
+logger = trt.Logger(trt.Logger.VERBOSE)
+runtime = trt.Runtime(logger)
+
+print("2: reading engine", flush=True)
+with open(path, "rb") as f:
+    data = f.read()
+
+print("3: deserializing", flush=True)
+engine = runtime.deserialize_cuda_engine(data)
+
+if engine is None:
+    raise RuntimeError("engine is None")
+
+print("4: num_io_tensors =", engine.num_io_tensors, flush=True)
+
+for i in range(engine.num_io_tensors):
+    print("5: index =", i, flush=True)
+
+    name = engine.get_tensor_name(i)
+    print("6: name =", name, flush=True)
+
+    shape = tuple(engine.get_tensor_shape(name))
+    print("7: shape =", shape, flush=True)
+
+    dtype = engine.get_tensor_dtype(name)
+    print("8: dtype =", dtype, flush=True)
+
+    mode = engine.get_tensor_mode(name)
+    print("9: mode =", mode, flush=True)
+
+print("TensorRT metadata OK", flush=True)
+PY
