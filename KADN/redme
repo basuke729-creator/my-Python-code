@@ -196,3 +196,25 @@ inferencer.destroy()
 
 print("3: destroy成功", flush=True)
 PY
+
+def destroy(self):
+    self.cfx.push()
+
+    try:
+        self.inputs.clear()
+        self.outputs.clear()
+        self.bindings.clear()
+
+        del self.context
+        del self.engine
+        del self.runtime
+        del self.stream
+
+    finally:
+        self.cfx.pop()
+        self.cfx.detach()
+
+detected_info = self.trt_inferencer.infer(
+    inputs=input_image,
+    output_shape=output_shape
+)
