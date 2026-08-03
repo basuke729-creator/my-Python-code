@@ -1,0 +1,52 @@
+python yolox_effnetv2_crossmatrix.py \
+  --input-video "/home/yamamoao/yolox_effnetv2/videos/R0010017.MP4" \
+  --yolox-root "/home/yamamoao/yolox_effnetv2/YOLOX" \
+  --yolox-exp "/home/yamamoao/yolox_effnetv2/YOLOX/exps/custom/yolox_tiny_custom.py" \
+  --yolox-name "yolox-tiny-custom" \
+  --yolox-ckpt "/home/yamamoao/yolox_effnetv2/YOLOX/YOLOX_outputs/yolox_tiny_custom_1202/best_ckpt.pth" \
+  --yolox-conf 0.2 \
+  --yolox-nms 0.45 \
+  --yolox-tsize-h 960 \
+  --yolox-tsize-w 1920 \
+  --eff-ckpt "/home/yamamoao/yolox_effnetv2/models/efficientnetv2/best.ckpt" \
+  --eff-model tf_efficientnetv2_m \
+  --eff-img-size 384 \
+  --eff-resize-mode pad \
+  --eff-bg black \
+  --crop-scale 1.25 \
+  --output-frames "/home/yamamoao/yolox_effnetv2/outputs/test/frames_R0010017_1" \
+  --output-csv "/home/yamamoao/yolox_effnetv2/outputs/test/predictions_R0010017_1.csv" \
+  --save-every 1 \
+  --jpg-quality 95 \
+  --warmup 2 \
+  --save-crops "/home/yamamoao/yolox_effnetv2/outputs/test/crops_R0010017_1" \
+  --cross-matrix-dir "/home/yamamoao/yolox_effnetv2/outputs/test/cross_matrix_R0010017_1" \
+  
+  
+  
+  --max-frames 100
+
+python yolox_effnetv2_crossmatrix.py \
+  --input-video 入力動画のパス
+  --yolox-root  YOLOX本体が配置されているフォルダを指定
+  --yolox-exp   YOLOXのモデル構成やクラス数などを定義したファイルを指定
+  --yolox-name  YOLOXモデルの名称
+  --yolox-ckpt  YOLOXの学習済み重みファイルを指定
+  --yolox-conf 0.2 YOLOXの検出信頼度のしきい値
+  --yolox-nms 0.45 NMSのしきい値です
+  --yolox-tsize-h 960 YOLOXへ入力する画像の高さ
+  --yolox-tsize-w 1920 YOLOXへ入力する画像の幅
+  --eff-ckpt EfficientNetV2の学習済みファイルを指定
+  --eff-model EfficientNetV2のモデル指定
+  --eff-img-size 384 EfficientNetV2へ入力する画像サイズ
+  --eff-resize-mode pad クロップ画像のリサイズ方法
+  --eff-bg black pad処理で追加する余白の色
+  --crop-scale YOLOXが検出したBBoxの幅と高さをクリップする倍率
+  --output-frames 結果保存先
+  --output-csv 　　結果保存先
+  --save-every 1 描画済みフレームを何フレームごとに保存するかを指定
+  --jpg-quality 95 保存するJPEG画像の品質指定
+  --warmup 2  warmup指定
+  --save-crops クロップ画像の保存先
+  --cross-matrix-dir 結果保存先
+  --max-frames 100　動作確認用　先頭の100フレームだけ
