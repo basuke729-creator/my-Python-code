@@ -218,3 +218,43 @@ detected_info = self.trt_inferencer.infer(
     inputs=input_image,
     output_shape=output_shape
 )
+
+PYTHONUNBUFFERED=1 python -X faulthandler - <<'PY'
+import tensorrt as trt
+
+print("1: TensorRT import OK", flush=True)
+
+import av
+print("2: av import OK", flush=True)
+
+import cv2
+print("3: cv2 import OK", flush=True)
+
+import gi
+gi.require_version("Gst", "1.0")
+gi.require_version("GstApp", "1.0")
+from gi.repository import Gst, GstApp, GLib
+print("4: gi/GStreamer import OK", flush=True)
+
+Gst.init(None)
+print("5: Gst.init OK", flush=True)
+
+path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
+
+logger = trt.Logger(trt.Logger.WARNING)
+runtime = trt.Runtime(logger)
+
+with open(path, "rb") as f:
+    engine = runtime.deserialize_cuda_engine(f.read())
+
+print("6: engine loaded", flush=True)
+
+for i in range(engine.num_io_tensors):
+    name = engine.get_tensor_name(i)
+    print("7:", name, flush=True)
+
+    shape = tuple(engine.get_tensor_shape(name))
+    print("8:", shape, flush=True)
+
+print("TensorRT import-combination test OK", flush=True)
+PY
