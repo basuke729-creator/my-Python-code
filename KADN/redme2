@@ -1,0 +1,128 @@
+推論実行後、outputs/test/配下に以下の結果が出力されます。
+
+outputs/
+└── test/
+    ├── crops_R0010017_1/
+    ├── cross_matrix_R0010017_1/
+    ├── frames_R0010017_1/
+    └── predictions_R0010017_1.csv
+① crops_R0010017_1
+crops_R0010017_1/
+内容
+
+YOLOXが検出した人物領域（Bounding Box）を、指定倍率（例：1.25倍）で切り出した画像を保存します。
+
+用途
+EfficientNetV2へ入力した画像の確認
+クロップ範囲の確認
+誤分類時の原因調査
+学習データとの比較
+② frames_R0010017_1
+frames_R0010017_1/
+内容
+
+各フレームに
+
+YOLOX検出結果
+EfficientNetV2分類結果
+信頼度
+
+を描画した画像を保存します。
+
+用途
+推論結果の目視確認
+Bounding Boxの確認
+ラベル表示の確認
+誤検出の確認
+③ predictions_R0010017_1.csv
+predictions_R0010017_1.csv
+内容
+
+動画中で検出された全対象について、
+
+フレーム番号
+Bounding Box座標
+YOLOX判定クラス
+YOLOX信頼度
+EfficientNetV2判定クラス
+EfficientNetV2信頼度
+
+などを保存します。
+
+用途
+推論結果の解析
+クロス集計の作成
+Excelでの集計
+統計解析
+④ cross_matrix_R0010017_1
+cross_matrix_R0010017_1/
+
+YOLOXとEfficientNetV2の判定結果を比較したクロス集計結果を保存します。
+
+中には以下の4ファイルが出力されます。
+
+yolox_effnet_count_matrix.csv
+
+YOLOXが判定したクラスごとに、
+EfficientNetV2が何件分類したかを集計した件数表です。
+
+用途
+
+件数集計
+Excel解析
+クラスごとの分布確認
+yolox_effnet_ratio_matrix.csv
+
+各YOLOXクラスについて、
+
+「EfficientNetV2が何％そのクラスへ分類したか」
+
+を割合（%）で表したCSVです。
+
+用途
+
+割合比較
+クラスごとの傾向確認
+yolox_effnet_count_heatmap.png
+
+件数ベースのクロス集計をヒートマップとして可視化した画像です。
+
+特徴
+
+色が濃いほど件数が多い
+YOLOX→EfficientNetV2の対応関係を直感的に確認可能
+yolox_effnet_ratio_heatmap.png
+
+割合ベース（各YOLOXクラスを100%とした場合）のヒートマップです。
+
+特徴
+
+行方向を100%として正規化
+YOLOXが検出したクラスをEfficientNetV2がどのような割合で分類したかを確認可能
+クラス間の分類傾向を把握しやすい
+出力ファイルの関係
+入力動画
+    │
+    ▼
+YOLOX検出
+    │
+    ├── frames/
+    │      （検出結果画像）
+    │
+    ├── crops/
+    │      （切り出し画像）
+    │
+    ▼
+EfficientNetV2分類
+    │
+    ▼
+predictions.csv
+    │
+    ▼
+cross_matrix/
+    ├── count_matrix.csv
+    ├── ratio_matrix.csv
+    ├── count_heatmap.png
+    └── ratio_heatmap.png
+
+この説明であれば、初めてコードを触る人でも「どのフォルダに何が出力され、何に使うのか」が一目で分かる資料になります。
