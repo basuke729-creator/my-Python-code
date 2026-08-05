@@ -1,52 +1,122 @@
-PYTHONUNBUFFERED=1 python -X faulthandler - <<'PY'
-import av
-from trt.tensorrt_inferencer import TensorRTInferencer
+def inference_func(self):
+    # from trt.tensorrt_inferencer import TensorRTInferencer
+    from yolox import postprocess
+    from visualization.classes import CLASS_NAME_MAP
+    from visualization.visualize_detection import DetectionVisualizer
 
-path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
+    engine_path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
+    score_threshold = 0.1
+    output_shape = (1, 151200, 15)
+    trt_inferencer = None
 
-print("PyAV test start", flush=True)
-inferencer = TensorRTInferencer(path)
-print("PyAV test OK", flush=True)
-PY
+    # ===== テスト用動画保存処理 追加開始 =====
+    output_video_path = "output/unsafe_act_monitoring_test.mp4"
+    output_video_fps = 29.97
+    video_writer = None
 
-PYTHONUNBUFFERED=1 python -X faulthandler - <<'PY'
-import cv2
-from trt.tensorrt_inferencer import TensorRTInferencer
+    os.makedirs(
+        os.path.dirname(output_video_path),
+        exist_ok=True
+    )
+    # ===== テスト用動画保存処理 追加終了 =====
 
-path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
+    try:
+        # trt_inferencer = TensorRTInferencer(engine_path)
+        visualizer = DetectionVisualizer()
 
-print("OpenCV test start", flush=True)
-inferencer = TensorRTInferencer(path)
-print("OpenCV test OK", flush=True)
-PY
+        while True:
+            if not self.capture_image_queue.empty():
+                while not self.capture_image_queue.empty():
+                    image = self.capture_image_queue.get()
+            else:
+                image = self.capture_image_queue.get()
 
-PYTHONUNBUFFERED=1 python -X faulthandler - <<'PY'
-import gi
+            if image is None:
+                break
 
-gi.require_version("Gst", "1.0")
-gi.require_version("GstApp", "1.0")
-from gi.repository import Gst, GstApp, GLib
-Gst.init(None)
+            image_height, image_width, _ = image.shape
+            input_image = image.transpose(2, 0, 1)
 
-from trt.tensorrt_inferencer import TensorRTInferencer
+            detected_info = self.trt_inferencer.infer(
+                inputs=input_image,
+                output_shape=output_shape
+            )
 
-path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
+            boxes, scores, class_ids = postprocess.get_detection_result(
+                inference_output=detected_info,
+                input_shape=(image_height, image_width),
+                ratio=1
+            )
 
-print("GStreamer test start", flush=True)
-inferencer = TensorRTInferencer(path)
-print("GStreamer test OK", flush=True)
-PY
+            out_image = image.copy()
 
-from trt.tensorrt_inferencer import TensorRTInferencer
+            for i in range(len(boxes)):
+                box = boxes[i]
+                score = scores[i]
+                class_id = int(class_ids[i])
 
-TRT_ENGINE_PATH = (
-    "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
-)
+                if score < score_threshold:
+                    continue
 
-print("TensorRTを映像ライブラリより先に初期化します", flush=True)
+                x_min = round(box[0])
+                y_min = round(box[1])
+                x_max = round(box[2])
+                y_max = round(box[3])
 
-GLOBAL_TRT_INFERENCER = TensorRTInferencer(
-    TRT_ENGINE_PATH
-)
+                visualizer.overlay_boxes(
+                    image=out_image,
+                    left_top=(x_min, y_min),
+                    right_bottom=(x_max, y_max),
+                    score=score,
+                    class_id=class_id,
+                    class_name_map=CLASS_NAME_MAP,
+                )
 
-print("TensorRTの先行初期化に成功しました", flush=True)
+            # ===== テスト用動画保存処理 追加開始 =====
+            if video_writer is None:
+                output_height, output_width = out_image.shape[:2]
+
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+                video_writer = cv2.VideoWriter(
+                    output_video_path,
+                    fourcc,
+                    output_video_fps,
+                    (output_width, output_height)
+                )
+
+                if not video_writer.isOpened():
+                    raise RuntimeError(
+                        "テスト動画保存用のVideoWriterを"
+                        "初期化できませんでした"
+                    )
+
+                print(
+                    f"テスト動画の保存を開始します: "
+                    f"{output_video_path}",
+                    flush=True
+                )
+
+            video_writer.write(out_image)
+            # ===== テスト用動画保存処理 追加終了 =====
+
+            self.output_image_queue.put(out_image)
+
+    except Exception as e:
+        print(f"予期しないエラーが発生しました:\n{e}")
+
+    finally:
+        # ===== テスト用動画保存処理 追加開始 =====
+        if video_writer is not None:
+            video_writer.release()
+            print(
+                f"テスト動画を保存しました: "
+                f"{output_video_path}",
+                flush=True
+            )
+        # ===== テスト用動画保存処理 追加終了 =====
+
+        if trt_inferencer is not None:
+            trt_inferencer.destroy()
+
+    return
