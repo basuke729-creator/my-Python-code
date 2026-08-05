@@ -1,0 +1,17 @@
+find ~/.cache/huggingface -type f \
+\( -name "*.safetensors" -o -name "*.bin" -o -name "*.pth" \) \
+2>/dev/null
+
+find ~/.cache/huggingface -iname "*efficientnetv2*" 2>/dev/null
+
+python - <<'PY'
+import timm
+
+model = timm.create_model(
+    "tf_efficientnetv2_s",
+    pretrained=True
+)
+
+print("事前学習済み重みの読み込み完了")
+print(model.pretrained_cfg)
+PY
