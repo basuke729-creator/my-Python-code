@@ -1,17 +1,18 @@
-find ~/.cache/huggingface -type f \
-\( -name "*.safetensors" -o -name "*.bin" -o -name "*.pth" \) \
-2>/dev/null
+PYTHONUNBUFFERED=1 python -X faulthandler - <<'PY'
+import av
+import cv2
+import gi
 
-find ~/.cache/huggingface -iname "*efficientnetv2*" 2>/dev/null
+gi.require_version("Gst", "1.0")
+gi.require_version("GstApp", "1.0")
+from gi.repository import Gst, GstApp, GLib
+Gst.init(None)
 
-python - <<'PY'
-import timm
+from trt.tensorrt_inferencer import TensorRTInferencer
 
-model = timm.create_model(
-    "tf_efficientnetv2_s",
-    pretrained=True
-)
+path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
 
-print("事前学習済み重みの読み込み完了")
-print(model.pretrained_cfg)
+print("1: TensorRTInferencer初期化開始", flush=True)
+inferencer = TensorRTInferencer(path)
+print("2: TensorRTInferencer初期化成功", flush=True)
 PY
