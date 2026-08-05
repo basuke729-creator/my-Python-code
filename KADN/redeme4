@@ -36,3 +36,17 @@ print("GStreamer test start", flush=True)
 inferencer = TensorRTInferencer(path)
 print("GStreamer test OK", flush=True)
 PY
+
+from trt.tensorrt_inferencer import TensorRTInferencer
+
+TRT_ENGINE_PATH = (
+    "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
+)
+
+print("TensorRTを映像ライブラリより先に初期化します", flush=True)
+
+GLOBAL_TRT_INFERENCER = TensorRTInferencer(
+    TRT_ENGINE_PATH
+)
+
+print("TensorRTの先行初期化に成功しました", flush=True)
