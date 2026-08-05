@@ -1,6 +1,26 @@
 PYTHONUNBUFFERED=1 python -X faulthandler - <<'PY'
 import av
+from trt.tensorrt_inferencer import TensorRTInferencer
+
+path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
+
+print("PyAV test start", flush=True)
+inferencer = TensorRTInferencer(path)
+print("PyAV test OK", flush=True)
+PY
+
+PYTHONUNBUFFERED=1 python -X faulthandler - <<'PY'
 import cv2
+from trt.tensorrt_inferencer import TensorRTInferencer
+
+path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
+
+print("OpenCV test start", flush=True)
+inferencer = TensorRTInferencer(path)
+print("OpenCV test OK", flush=True)
+PY
+
+PYTHONUNBUFFERED=1 python -X faulthandler - <<'PY'
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -12,7 +32,7 @@ from trt.tensorrt_inferencer import TensorRTInferencer
 
 path = "model/yolox_tiny_20251205_op18_rtx4060ti_fp16.trt"
 
-print("1: TensorRTInferencer初期化開始", flush=True)
+print("GStreamer test start", flush=True)
 inferencer = TensorRTInferencer(path)
-print("2: TensorRTInferencer初期化成功", flush=True)
+print("GStreamer test OK", flush=True)
 PY
