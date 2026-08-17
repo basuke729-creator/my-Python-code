@@ -1,123 +1,148 @@
-python - <<'PY'
-import torch
-
-path = "model/best.ckpt"
-
-ckpt = torch.load(path, map_location="cpu")
-
-print("type:", type(ckpt))
-
-if isinstance(ckpt, dict):
-    print("keys:", ckpt.keys())
-
-    if "class_names" in ckpt:
-        print("class_names:", ckpt["class_names"])
-
-    state = ckpt.get("model", ckpt)
-
-    print("state_dict keys sample:")
-    for i, key in enumerate(state.keys()):
-        print(key)
-        if i >= 9:
-            break
-PY
-
-python - <<'PY'
 import torch
 import timm
+from torchvision import transforms
+from PIL import Image
 
-CKPT = "model/best.ckpt"
-MODEL_NAME = "tf_efficientnetv2_s"
+EFFNET_CKPT_PATH = "model/best.ckpt"
+EFFNET_MODEL_NAME = "tf_efficientnetv2_m"
+EFFNET_IMG_SIZE = 384
+EFFNET_CROP_SCALE = 1.25
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-ckpt = torch.load(CKPT, map_location="cpu")
-state = ckpt.get("model", ckpt)
-
-names = ckpt.get("class_names")
-
-if names is not None:
-    names = [str(x) for x in names]
-    num_classes = len(names)
-else:
-    candidates = []
-
-    for key, value in state.items():
-        if key.endswith("weight") and getattr(value, "ndim", 0) == 2:
-            bias_key = key[:-6] + "bias"
-
-            if bias_key in state:
-                candidates.append(int(value.shape[0]))
-
-    if not candidates:
-        raise RuntimeError("クラス数を推定できませんでした")
-
-    num_classes = candidates[-1]
-    names = [str(i) for i in range(num_classes)]
-
-print("device:", device)
-print("num_classes:", num_classes)
-print("class_names:", names)
-
-model = timm.create_model(
-    MODEL_NAME,
-    pretrained=False,
-    num_classes=num_classes
+EFFNET_DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-model.load_state_dict(state, strict=True)
-model.to(device)
-model.eval()
-
-print("EfficientNetV2 load OK")
-PY
-
-python - <<'PY'
-import torch
-import timm
-
-CKPT = "model/best.ckpt"
-MODEL_NAME = "tf_efficientnetv2_s"
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-ckpt = torch.load(CKPT, map_location="cpu")
-state = ckpt.get("model", ckpt)
-
-names = ckpt.get("class_names")
-
-if names is not None:
-    names = [str(x) for x in names]
-    num_classes = len(names)
-else:
-    candidates = []
-
-    for key, value in state.items():
-        if key.endswith("weight") and getattr(value, "ndim", 0) == 2:
-            bias_key = key[:-6] + "bias"
-
-            if bias_key in state:
-                candidates.append(int(value.shape[0]))
-
-    if not candidates:
-        raise RuntimeError("クラス数を推定できませんでした")
-
-    num_classes = candidates[-1]
-    names = [str(i) for i in range(num_classes)]
-
-print("device:", device)
-print("num_classes:", num_classes)
-print("class_names:", names)
-
-model = timm.create_model(
-    MODEL_NAME,
-    pretrained=False,
-    num_classes=num_classes
+_eff_ckpt = torch.load(
+    EFFNET_CKPT_PATH,
+    map_location="cpu"
 )
 
-model.load_state_dict(state, strict=True)
-model.to(device)
-model.eval()
+EFFNET_CLASS_NAMES = [
+    str(x) for x in _eff_ckpt["class_names"]
+]
 
-print("EfficientNetV2 load OK")
-PY
+GLOBAL_EFFNET = timm.create_model(
+    EFFNET_MODEL_NAME,
+    pretrained=False,
+    num_classes=len(EFFNET_CLASS_NAMES)
+)
+
+GLOBAL_EFFNET.load_state_dict(
+    _eff_ckpt["model"],
+    strict=True
+)
+
+GLOBAL_EFFNET.to(EFFNET_DEVICE)
+GLOBAL_EFFNET.eval()
+
+EFFNET_TRANSFORM = transforms.Compose([
+    transforms.Resize(
+        (EFFNET_IMG_SIZE, EFFNET_IMG_SIZE)
+    ),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+print(
+    f"EfficientNetV2 initialized: "
+    f"{EFFNET_DEVICE}",
+    flush=True
+)
+
+def expand_bbox(
+    self,
+    box,
+    image_width,
+    image_height,
+    scale=1.25
+):
+    x_min, y_min, x_max, y_max = box
+
+    center_x = (x_min + x_max) / 2
+    center_y = (y_min + y_max) / 2
+
+    width = (x_max - x_min) * scale
+    height = (y_max - y_min) * scale
+
+    new_x_min = max(
+        0,
+        int(center_x - width / 2)
+    )
+    new_y_min = max(
+        0,
+        int(center_y - height / 2)
+    )
+    new_x_max = min(
+        image_width,
+        int(center_x + width / 2)
+    )
+    new_y_max = min(
+        image_height,
+        int(center_y + height / 2)
+    )
+
+    return (
+        new_x_min,
+        new_y_min,
+        new_x_max,
+        new_y_max
+    )
+
+crop_x_min, crop_y_min, crop_x_max, crop_y_max = (
+    self.expand_bbox(
+        box,
+        image_width,
+        image_height,
+        EFFNET_CROP_SCALE
+    )
+)
+
+crop = image[
+    crop_y_min:crop_y_max,
+    crop_x_min:crop_x_max
+]
+
+if crop.size == 0:
+    continue
+
+crop_rgb = cv2.cvtColor(
+    crop,
+    cv2.COLOR_BGR2RGB
+)
+
+crop_pil = Image.fromarray(crop_rgb)
+
+eff_input = EFFNET_TRANSFORM(
+    crop_pil
+).unsqueeze(0).to(EFFNET_DEVICE)
+
+with torch.no_grad():
+    eff_logits = GLOBAL_EFFNET(eff_input)
+    eff_probs = torch.softmax(
+        eff_logits,
+        dim=1
+    )
+
+eff_score, eff_class_id = torch.max(
+    eff_probs,
+    dim=1
+)
+
+eff_class_id = int(eff_class_id.item())
+eff_score = float(eff_score.item())
+
+eff_class_name = EFFNET_CLASS_NAMES[
+    eff_class_id
+]
+
+print(
+    f"YOLOX: class={class_id}, "
+    f"score={score:.3f} | "
+    f"EffNet: class={eff_class_id}, "
+    f"name={eff_class_name}, "
+    f"score={eff_score:.3f}",
+    flush=True
+)
