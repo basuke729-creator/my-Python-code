@@ -317,3 +317,52 @@ def inference_func(self):
             trt_inferencer.destroy()
 
     return
+
+self.effnet = None
+self.effnet_device = None
+self.effnet_class_names = None
+self.effnet_transform = None
+
+if self.param["detection_mode"] == "yolox_effnetv2":
+    self.effnet_device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    eff_ckpt = torch.load(
+        EFFNET_CKPT_PATH,
+        map_location="cpu"
+    )
+
+    self.effnet_class_names = [
+        str(x) for x in eff_ckpt["class_names"]
+    ]
+
+    self.effnet = timm.create_model(
+        EFFNET_MODEL_NAME,
+        pretrained=False,
+        num_classes=len(self.effnet_class_names)
+    )
+
+    self.effnet.load_state_dict(
+        eff_ckpt["model"],
+        strict=True
+    )
+
+    self.effnet.to(self.effnet_device)
+    self.effnet.eval()
+
+    self.effnet_transform = transforms.Compose([
+        transforms.Resize(
+            (EFFNET_IMG_SIZE, EFFNET_IMG_SIZE)
+        ),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+    ])
+
+    print(
+        f"EfficientNetV2 initialized: {self.effnet_device}",
+        flush=True
+    )
