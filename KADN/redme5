@@ -1,0 +1,123 @@
+python - <<'PY'
+import torch
+
+path = "model/best.ckpt"
+
+ckpt = torch.load(path, map_location="cpu")
+
+print("type:", type(ckpt))
+
+if isinstance(ckpt, dict):
+    print("keys:", ckpt.keys())
+
+    if "class_names" in ckpt:
+        print("class_names:", ckpt["class_names"])
+
+    state = ckpt.get("model", ckpt)
+
+    print("state_dict keys sample:")
+    for i, key in enumerate(state.keys()):
+        print(key)
+        if i >= 9:
+            break
+PY
+
+python - <<'PY'
+import torch
+import timm
+
+CKPT = "model/best.ckpt"
+MODEL_NAME = "tf_efficientnetv2_s"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+ckpt = torch.load(CKPT, map_location="cpu")
+state = ckpt.get("model", ckpt)
+
+names = ckpt.get("class_names")
+
+if names is not None:
+    names = [str(x) for x in names]
+    num_classes = len(names)
+else:
+    candidates = []
+
+    for key, value in state.items():
+        if key.endswith("weight") and getattr(value, "ndim", 0) == 2:
+            bias_key = key[:-6] + "bias"
+
+            if bias_key in state:
+                candidates.append(int(value.shape[0]))
+
+    if not candidates:
+        raise RuntimeError("クラス数を推定できませんでした")
+
+    num_classes = candidates[-1]
+    names = [str(i) for i in range(num_classes)]
+
+print("device:", device)
+print("num_classes:", num_classes)
+print("class_names:", names)
+
+model = timm.create_model(
+    MODEL_NAME,
+    pretrained=False,
+    num_classes=num_classes
+)
+
+model.load_state_dict(state, strict=True)
+model.to(device)
+model.eval()
+
+print("EfficientNetV2 load OK")
+PY
+
+python - <<'PY'
+import torch
+import timm
+
+CKPT = "model/best.ckpt"
+MODEL_NAME = "tf_efficientnetv2_s"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+ckpt = torch.load(CKPT, map_location="cpu")
+state = ckpt.get("model", ckpt)
+
+names = ckpt.get("class_names")
+
+if names is not None:
+    names = [str(x) for x in names]
+    num_classes = len(names)
+else:
+    candidates = []
+
+    for key, value in state.items():
+        if key.endswith("weight") and getattr(value, "ndim", 0) == 2:
+            bias_key = key[:-6] + "bias"
+
+            if bias_key in state:
+                candidates.append(int(value.shape[0]))
+
+    if not candidates:
+        raise RuntimeError("クラス数を推定できませんでした")
+
+    num_classes = candidates[-1]
+    names = [str(i) for i in range(num_classes)]
+
+print("device:", device)
+print("num_classes:", num_classes)
+print("class_names:", names)
+
+model = timm.create_model(
+    MODEL_NAME,
+    pretrained=False,
+    num_classes=num_classes
+)
+
+model.load_state_dict(state, strict=True)
+model.to(device)
+model.eval()
+
+print("EfficientNetV2 load OK")
+PY
