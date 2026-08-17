@@ -146,3 +146,19 @@ print(
     f"score={eff_score:.3f}",
     flush=True
 )
+
+eff_text = (
+    f"EffNet: class={eff_class_id} "
+    f"score={eff_score:.2f}"
+)
+
+cv2.putText(
+    out_image,
+    eff_text,
+    (x_min, min(y_min + 40, image_height - 10)),
+    cv2.FONT_HERSHEY_SIMPLEX,
+    1.0,
+    (0, 255, 255),
+    2,
+    cv2.LINE_AA
+)
