@@ -1,0 +1,129 @@
+python yolox_effnetv2_pipeline_final.py \
+  --input-video "/home/yamanao/yolox_effnetv2/videos/R0010117.MP4" \
+  --yolox-root "/home/yamanao/yolox_effnetv2/YOLOX" \
+  --yolox-exp "/home/yamanao/yolox_effnetv2/YOLOX/exps/custom/yolox_tiny_custom.py" \
+  --yolox-name "yolox-tiny-custom" \
+  --yolox-ckpt "/home/yamanao/yolox_effnetv2/YOLOX/YOLOX_outputs/yolox_tiny_custom/best_ckpt.pth" \
+  --yolox-conf 0.2 \
+  --yolox-nms 0.45 \
+  --yolox-tsize-h 960 \
+  --yolox-tsize-w 1920 \
+  --eff-ckpt "/home/yamanao/yolox_effnetv2/models/efficientnetv2/best.ckpt" \
+  --eff-model tf_efficientnetv2_m \
+  --eff-img-size 384 \
+  --eff-resize-mode pad \
+  --eff-bg black \
+  --crop-scale 1.25 \
+  --output-frames "/home/yamanao/yolox_effnetv2/outputs/test/frames" \
+  --output-csv "/home/yamanao/yolox_effnetv2/outputs/test/predictions.csv" \
+  --save-every 1 \
+  --jpg-quality 95 \
+  --warmup 2 \
+  --max-frames 10
+  --save-crops "/home/yamanao/yolox_effnetv2/outputs/test/crops" \
+  --cross-matrix-dir "/home/yamanao/yolox_effnetv2/outputs/test/cross_matrix" \
+
+import importlib.util
+
+exp_path = os.path.abspath(args.yolox_exp)
+module_name = f"yolox_custom_exp_{abs(hash(exp_path))}"
+
+spec = importlib.util.spec_from_file_location(module_name, exp_path)
+if spec is None or spec.loader is None:
+    raise ImportError(f"YOLOX expファイルを読み込めません: {exp_path}")
+
+exp_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(exp_module)
+
+if not hasattr(exp_module, "Exp"):
+    raise ImportError(
+        f"{exp_path} に Exp クラスがありません。"
+    )
+
+exp = exp_module.Exp()
+
+# ============================================================
+# YOLOX側の表示順
+# ============================================================
+yolox_order = [
+    "1st stepladder",
+    "2nd stepladder",
+    "person N/A",
+    "safe stepladder",
+    "safe workplatform",
+    "stepladder",
+    "straddling",
+    "unstable stepladder",
+    "workplatform",
+    "unstable workplatform",
+]
+
+# ============================================================
+# EfficientNetV2側の表示順
+# YOLOX側と意味が対応する順番
+# ============================================================
+effnet_order = [
+    "脚立1段目の人",
+    "脚立2段目の人",
+    "その他の人",
+    "脚立上の安全な人",
+    "立馬上の安全な人",
+    "脚立",
+    "脚立を跨ぐ人",
+    "脚立上の不安定姿勢の人",
+    "立馬",
+    "立馬上の不安定姿勢の人",
+]
+
+# ============================================================
+# 実際に行列内に存在する行・列を優先順に並べる
+# 存在しないクラス名は無視する
+# 未定義のクラスがあれば末尾に残す
+# ============================================================
+ordered_rows = [
+    class_name
+    for class_name in yolox_order
+    if class_name in count_matrix.index
+]
+
+remaining_rows = [
+    class_name
+    for class_name in count_matrix.index
+    if class_name not in ordered_rows
+]
+
+final_row_order = ordered_rows + remaining_rows
+
+
+ordered_columns = [
+    class_name
+    for class_name in effnet_order
+    if class_name in count_matrix.columns
+]
+
+remaining_columns = [
+    class_name
+    for class_name in count_matrix.columns
+    if class_name not in ordered_columns
+]
+
+final_column_order = ordered_columns + remaining_columns
+
+
+# ============================================================
+# カウント行列を並べ替え
+# ============================================================
+count_matrix = count_matrix.reindex(
+    index=final_row_order,
+    columns=final_column_order,
+    fill_value=0,
+)
+
+# ============================================================
+# 比率行列を並べ替え
+# ============================================================
+ratio_matrix = ratio_matrix.reindex(
+    index=final_row_order,
+    columns=final_column_order,
+    fill_value=0.0,
+)
