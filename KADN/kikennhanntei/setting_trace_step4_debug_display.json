@@ -1,0 +1,12 @@
+{
+    "pre_event_sec": 15,
+    "post_event_sec": 15,
+    "recording_path": "~/unsafe_act_monitoring/output/",
+    "video_filename_format": "REC_%Y%m%d%H%M%S.mp4",
+    "detection_mode": "yolox",
+    "track_missing_sec": 0.5,
+    "alert_judgment_sec": 0.3,
+    "alert_threshold": 0.6,
+    "alert_continuation_sec": 1.0,
+    "debug_track_display": true
+}
