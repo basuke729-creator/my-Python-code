@@ -17,3 +17,45 @@ if isinstance(ckpt, dict):
         if any(x in name for x in ["class", "label", "idx", "name"]):
             print(f"{key}: {value}")
 PY
+
+
+
+
+
+
+
+
+
+import math
+
+def expand_bbox(
+    self,
+    box,
+    image_width,
+    image_height,
+    scale_left,
+    scale_right,
+    scale_top,
+    scale_bottom,
+):
+    x_min, y_min, x_max, y_max = box
+
+    width = max(1e-6, x_max - x_min)
+    height = max(1e-6, y_max - y_min)
+
+    dx_left = (scale_left - 1.0) * width
+    dx_right = (scale_right - 1.0) * width
+    dy_top = (scale_top - 1.0) * height
+    dy_bottom = (scale_bottom - 1.0) * height
+
+    x1 = max(0.0, x_min - dx_left)
+    y1 = max(0.0, y_min - dy_top)
+    x2 = min(float(image_width), x_max + dx_right)
+    y2 = min(float(image_height), y_max + dy_bottom)
+
+    new_x_min = int(math.floor(x1))
+    new_y_min = int(math.floor(y1))
+    new_x_max = int(math.ceil(x2))
+    new_y_max = int(math.ceil(y2))
+
+    return new_x_min, new_y_min, new_x_max, new_y_max
