@@ -1,0 +1,19 @@
+python - <<'PY'
+import torch
+
+ckpt = torch.load("best.ckpt", map_location="cpu", weights_only=False)
+
+print("=== checkpoint type ===")
+print(type(ckpt))
+
+if isinstance(ckpt, dict):
+    print("\n=== top-level keys ===")
+    for key in ckpt.keys():
+        print(key)
+
+    print("\n=== class-related contents ===")
+    for key, value in ckpt.items():
+        name = str(key).lower()
+        if any(x in name for x in ["class", "label", "idx", "name"]):
+            print(f"{key}: {value}")
+PY
