@@ -1,0 +1,3 @@
+python -c "import torch; c=torch.load('model/best.ckpt', map_location='cpu'); print(c['class_names'])"
+
+python -c "import torch; c=torch.load('model/best.ckpt', map_location='cpu'); [print(i, name) for i, name in enumerate(c['class_names'])]"
