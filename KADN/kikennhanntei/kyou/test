@@ -1,3 +1,21 @@
 python -c "import torch; c=torch.load('model/best.ckpt', map_location='cpu'); print(c['class_names'])"
 
 python -c "import torch; c=torch.load('model/best.ckpt', map_location='cpu'); [print(i, name) for i, name in enumerate(c['class_names'])]"
+
+calc_bbox_info()	# トラッキング用BBox情報算出：BBoxの中心座標・サイズ情報を算出	トラッキングで比較するためのBBox情報を算出
+bbox_intersects()	# BBox重なり判定：前フレームと現フレームのBBoxが重なっているか判定	前後フレームのBBoxが重なっているか確認
+tracking_cost()	# トラッキングコスト算出：BBoxの中心距離と対角線長の差から対応付けコストを算出	同一人物候補の対応付けコストを算出
+update_tracks()	# トラッキング更新：検出結果を既存Track IDへ対応付けし、欠損・新規Trackを管理	Track IDの割り当て・更新をまとめて管理
+update_tracks() 内	# 現フレームの各検出BBoxからトラッキング用情報を生成	現フレームの検出結果をトラッキング用に準備
+update_tracks() 内	# 既存Trackと現フレーム検出の対応候補を作成	前フレームまでのTrackとの対応候補を作成
+update_tracks() 内	# コストが小さい候補から1対1でTrack IDを対応付け	最も近い候補からTrack IDを対応付け
+update_tracks() 内	# 未検出Trackは設定時間内であれば保持	一時的な未検出でもTrack IDを維持
+update_tracks() 内	# 未対応の検出結果には新しいTrack IDを付与	新しく現れた人物に新規IDを割り当て
+update_alert_judgment()	# 警報発令判定：設定時間内の危険判定割合からTrackごとの警報条件成立を判定	Trackごとに警報発令条件を判定
+update_alert_judgment() 内	# 前回判定から一定時間以上空いた場合は判定履歴をリセット	長時間空いた古い判定履歴を引き継がない
+update_alert_judgment() 内	# 現在の危険判定を履歴へ追加	現フレームの安全／危険判定を履歴に追加
+update_alert_judgment() 内	# 判定必要時間経過後、危険割合が閾値以上で警報条件成立	設定時間と危険割合から発令条件を決定
+update_alert_continuation()	# 警報継続判定：警報条件解除後も設定時間内はTrackの警報状態を継続	一瞬安全になってもすぐに警報解除しない
+update_alert_continuation() 内	# 警報条件成立時は警報状態を有効化し、成立時刻を更新	警報状態をONにして時刻を記録
+update_alert_continuation() 内	# 最終成立時刻から継続時間を超えた場合は警報状態を解除	設定した継続時間を超えたら警報解除
+expand_bbox()	# EfficientNetV2用BBox拡張：上下左右の倍率でBBoxを拡張し画像範囲内にクリップ	YOLOXのBBoxを上下左右に拡張してEfficientNetV2へ渡す
